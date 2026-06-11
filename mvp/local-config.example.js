@@ -1,0 +1,72 @@
+window.AI_VIDEO_LOCAL_CONFIG = {
+  integrations: {
+    llm: {
+      mode: "http",
+      provider: "custom-llm",
+      apiStyle: "openai-chat",
+      endpoint: "https://toapis.com/v1/chat/completions",
+      model: "gpt-5.5",
+      apiKey: "replace-with-toapis-key",
+    },
+    video: {
+      mode: "http",
+      provider: "tongyi-wanxiang",
+      apiStyle: "dashscope-video",
+      endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+      statusEndpoint: "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
+      model: "wan2.7-i2v-2026-04-25",
+      apiKey: "replace-with-dashscope-key",
+    },
+    publisher: {
+      mode: "http",
+      provider: "posteverywhere",
+      endpoint: "https://app.posteverywhere.ai/api/v1/posts",
+      workspaceId: "",
+      accountIds: "replace-with-account-ids-from-get-accounts",
+      mediaIds: "",
+      apiKey: "replace-with-posteverywhere-key",
+    },
+  },
+  integrationProfiles: {
+    video: [
+      {
+        id: "local-toapis-seedance-2",
+        name: "Seedance 2 / ToAPIs",
+        provider: "toapis-seedance",
+        endpoint: "https://toapis.com/v1/videos/generations",
+        model: "seedance-2",
+        apiStyle: "toapis-video",
+        config: {
+          mode: "http",
+          provider: "toapis-seedance",
+          apiStyle: "toapis-video",
+          endpoint: "https://toapis.com/v1/videos/generations",
+          statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+          model: "seedance-2",
+          apiKey: "replace-with-toapis-key",
+        },
+      },
+      {
+        id: "local-toapis-seedance-fast",
+        name: "Seedance 2 Fast / ToAPIs",
+        provider: "toapis-seedance",
+        endpoint: "https://toapis.com/v1/videos/generations",
+        model: "seedance-2-fast",
+        apiStyle: "toapis-video",
+        config: {
+          mode: "http",
+          provider: "toapis-seedance",
+          apiStyle: "toapis-video",
+          endpoint: "https://toapis.com/v1/videos/generations",
+          statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+          model: "seedance-2-fast",
+          apiKey: "replace-with-toapis-key",
+        },
+      },
+    ],
+  },
+  activeIntegrationProfileIds: {
+    video: "local-toapis-seedance-fast",
+  },
+  selectedPlatforms: ["tiktok"],
+};

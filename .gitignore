@@ -1,0 +1,12 @@
+mvp/local-config.js
+mvp/local-config.json
+.env
+.env.*
+*.local
+
+.DS_Store
+node_modules/
+
+.playwright-cli/
+outputs/
+*.log
