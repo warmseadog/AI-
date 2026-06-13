@@ -72,6 +72,52 @@ async function main() {
       res.end(Buffer.from("downloaded-video"));
       return;
     }
+    if (req.url === "/media/upload" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          data: {
+            media_id: "media-verify-1",
+            upload_url: `${upstreamBaseUrl}/media/upload-target`,
+            upload_method: {
+              method: "PUT",
+              content_type: "video/mp4",
+              headers: { "x-upload-token": "verify" },
+            },
+          },
+          error: null,
+        }));
+      });
+      return;
+    }
+    if (req.url === "/media/upload-target" && req.method === "PUT") {
+      req.on("data", (chunk) => {
+        call.body += chunk.toString("utf8");
+      });
+      req.on("end", () => {
+        call.contentType = req.headers["content-type"] || "";
+        call.uploadToken = req.headers["x-upload-token"] || "";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+    if (req.url === "/media/media-verify-1/complete" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          data: { id: "media-verify-1", status: "ready", type: "video" },
+          error: null,
+        }));
+      });
+      return;
+    }
     if (req.url === "/chat/stream" && req.method === "POST") {
       req.on("data", (chunk) => {
         call.body += chunk;
@@ -113,40 +159,70 @@ async function main() {
       });
       return;
     }
+    if (req.url === "/chat/embedded-error-stream" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write(JSON.stringify({ error: { message: "gpt-5.5 所有账号暂时不可用，请 40 秒后重试", type: "rate_limit_exceeded", code: null } }));
+        res.write("\n");
+        res.write(JSON.stringify({ choices: [], usage: { prompt_tokens: 15195, completion_tokens: 0, total_tokens: 15195 } }));
+        res.end("\n");
+      });
+      return;
+    }
+    if (req.url === "/chat/empty-sse" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1913, completion_tokens: 0, total_tokens: 1913 } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      });
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     if (req.method === "GET") {
       res.end(JSON.stringify({ output: { task_status: "SUCCEEDED", video_url: "https://example.test/video.mp4" } }));
       return;
     }
-    res.end(JSON.stringify({
-      choices: [
-        {
-          message: {
-            content: JSON.stringify({
-              contentPlan: {
-                productUnderstanding: "挂脖风扇，免手持，适合夏季户外。",
-                targetAudience: "TikTok 美国用户。",
-                keySellingPoints: ["hands-free", "portable"],
-                usageScenarios: ["commute", "outdoor"],
-                strategy: "热浪痛点开场，展示佩戴和风速。",
-                hook: "Wear the breeze.",
-                reviewSummary: "避免夸大降温效果。",
-                complianceNotes: ["不承诺具体降温度数"],
-                scenes: [
-                  {
-                    time: "0-3s",
-                    title: "热浪痛点",
-                    visual: "用户在户外排队出汗，拿出挂脖风扇。",
-                    subtitle: "Too hot outside?",
-                    videoPrompt: "vertical video, neck fan reveal in summer queue",
-                  },
-                ],
-              },
-            }),
+    req.on("data", (chunk) => {
+      call.body += chunk;
+    });
+    req.on("end", () => {
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                contentPlan: {
+                  productUnderstanding: "挂脖风扇，免手持，适合夏季户外。",
+                  targetAudience: "TikTok 美国用户。",
+                  keySellingPoints: ["hands-free", "portable"],
+                  usageScenarios: ["commute", "outdoor"],
+                  strategy: "热浪痛点开场，展示佩戴和风速。",
+                  hook: "Wear the breeze.",
+                  reviewSummary: "避免夸大降温效果。",
+                  complianceNotes: ["不承诺具体降温度数"],
+                  scenes: [
+                    {
+                      time: "0-3s",
+                      title: "热浪痛点",
+                      visual: "用户在户外排队出汗，拿出挂脖风扇。",
+                      subtitle: "Too hot outside?",
+                      videoPrompt: "vertical video, neck fan reveal in summer queue",
+                    },
+                  ],
+                },
+              }),
+            },
           },
-        },
-      ],
-    }));
+        ],
+      }));
+    });
   });
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const upstreamBaseUrl = `http://127.0.0.1:${upstream.address().port}`;
@@ -223,6 +299,17 @@ async function main() {
     });
     assert.strictEqual(created.storyboard.length, 10, "streamed storyboard result is repaired to the requested 10 scenes");
 
+    const embeddedErrorStream = await requestText(baseUrl, "/api/provider/storyboard-stream", {
+      providerRequest: Object.assign({}, storyboardRequest, {
+        endpoint: `${upstreamBaseUrl}/chat/embedded-error-stream`,
+      }),
+    });
+    const embeddedErrorLines = embeddedErrorStream.text.trim().split("\n").map((line) => JSON.parse(line));
+    const embeddedErrorDone = embeddedErrorLines.at(-1);
+    assert.strictEqual(embeddedErrorDone.type, "done", "embedded upstream error still ends the stream");
+    assert.strictEqual(embeddedErrorDone.ok, false, "embedded upstream error marks stream as failed");
+    assert.match(embeddedErrorDone.error, /gpt-5\.5.*不可用|重试/i, "embedded upstream error is surfaced to the UI");
+
     const rejectedUpload = await requestRaw(baseUrl, "/api/uploads/video?filename=note.txt", Buffer.from("not-video"), "text/plain", { expectOk: false });
     assert.match(rejectedUpload.data.error, /mp4|mov|webm|视频/i, "non-video upload rejection explains accepted formats");
 
@@ -263,9 +350,18 @@ async function main() {
     });
     assert.strictEqual(reverseProvider.mode, "http", "reverse storyboard provider uses HTTP proxy");
     assert.strictEqual(upstreamCalls.at(-1).method, "POST", "reverse storyboard proxy uses POST");
+    assert.strictEqual(JSON.parse(upstreamCalls.at(-1).body).stream, false, "non-stream reverse proxy explicitly disables upstream streaming");
     const reverseRequestLog = fs.readFileSync(providerEventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line)).reverse().find((entry) => entry.kind === "reverse-storyboard" && entry.phase === "request");
     assert.strictEqual(reverseRequestLog.requestSummary.imagePartCount, 1, "reverse request log records inline image parts");
     assert.strictEqual(reverseRequestLog.requestSummary.inlineFrameImageCount, 1, "reverse request log records inline frame metadata count");
+
+    const emptySseFailure = await request(baseUrl, "/api/provider/reverse-storyboard", {
+      providerRequest: Object.assign({}, reverseProviderRequest, {
+        endpoint: `${upstreamBaseUrl}/chat/empty-sse`,
+      }),
+    }, { expectOk: false });
+    assert.strictEqual(emptySseFailure.response.status, 502, "reverse proxy rejects empty SSE responses");
+    assert.match(emptySseFailure.data.error, /没有返回内容|empty/i, "reverse proxy surfaces empty upstream response clearly");
 
     const videoConnection = await request(baseUrl, "/api/provider/test", {
       config: {
@@ -369,10 +465,73 @@ async function main() {
       providerRequest: created.providerRequests.publisher,
     });
     assert.strictEqual(publisher.mode, "http", "publisher uses HTTP proxy");
+    const cancelPublisher = await request(baseUrl, "/api/provider/publisher", {
+      providerRequest: {
+        provider: "posteverywhere",
+        mode: "http",
+        method: "DELETE",
+        endpoint: `${upstreamBaseUrl}/publisher/post-hosted-1`,
+        apiKey: "publisher-secret-verify",
+        body: null,
+      },
+    });
+    assert.strictEqual(cancelPublisher.mode, "http", "publisher schedule cancellation uses HTTP proxy");
+    const cancelPublisherCall = upstreamCalls.find((call) => call.url === "/publisher/post-hosted-1");
+    assert.ok(cancelPublisherCall, "publisher schedule cancellation hits the hosted post endpoint");
+    assert.strictEqual(cancelPublisherCall.method, "DELETE", "publisher schedule cancellation forwards DELETE");
+    assert.strictEqual(cancelPublisherCall.body, "", "publisher schedule cancellation does not send an empty JSON body");
+    const reschedulePublisher = await request(baseUrl, "/api/provider/publisher", {
+      providerRequest: {
+        provider: "posteverywhere",
+        mode: "http",
+        method: "PATCH",
+        endpoint: `${upstreamBaseUrl}/publisher/post-hosted-1`,
+        apiKey: "publisher-secret-verify",
+        body: {
+          scheduled_for: "2026-06-13T00:00:00.000Z",
+          timezone: "UTC",
+        },
+      },
+    });
+    assert.strictEqual(reschedulePublisher.mode, "http", "publisher schedule time update uses HTTP proxy");
+    const reschedulePublisherCall = upstreamCalls.filter((call) => call.url === "/publisher/post-hosted-1").at(-1);
+    assert.ok(reschedulePublisherCall, "publisher schedule time update hits the hosted post endpoint");
+    assert.strictEqual(reschedulePublisherCall.method, "PATCH", "publisher schedule time update forwards PATCH");
+    assert.deepStrictEqual(JSON.parse(reschedulePublisherCall.body), {
+      scheduled_for: "2026-06-13T00:00:00.000Z",
+      timezone: "UTC",
+    }, "publisher schedule time update sends the new hosted scheduled time");
     const providerEvents = fs.readFileSync(providerEventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     const publisherEvent = providerEvents.find((event) => event.kind === "publisher" && event.phase === "response");
     assert.ok(publisherEvent, "publisher provider response is logged");
     assert.strictEqual(publisherEvent.ok, true, "publisher log records success");
+    const publisherDnsFailure = await request(baseUrl, "/api/provider/publisher", {
+      providerRequest: Object.assign({}, created.providerRequests.publisher, {
+        endpoint: "https://definitely-not-a-real-posteverywhere-host.invalid/posts",
+      }),
+    }, { expectOk: false });
+    assert.match(publisherDnsFailure.data.error, /fetch failed \(.+\)/i, "publisher proxy surfaces fetch failure cause details");
+    const mediaUpload = await request(baseUrl, "/api/publisher/media-upload", {
+      endpoint: `${upstreamBaseUrl}/posts`,
+      apiKey: "publisher-secret-verify",
+      sourceUrl: "/outputs/verify-static-video.mp4",
+      filename: "verify-static-video.mp4",
+      contentType: "video/mp4",
+    });
+    assert.strictEqual(mediaUpload.mediaId, "media-verify-1", "publisher media upload returns a media id for posts");
+    assert.strictEqual(mediaUpload.complete.status, "ready", "publisher media upload completes the media item");
+    const mediaCreateCall = upstreamCalls.find((call) => call.url === "/media/upload");
+    assert.ok(mediaCreateCall, "publisher media upload requests a presigned upload URL");
+    assert.deepStrictEqual(JSON.parse(mediaCreateCall.body), {
+      filename: "verify-static-video.mp4",
+      content_type: "video/mp4",
+      size: Buffer.from("verify-video").length,
+    }, "publisher media upload sends PostEverywhere upload metadata");
+    const mediaPutCall = upstreamCalls.find((call) => call.url === "/media/upload-target");
+    assert.ok(mediaPutCall, "publisher media upload sends bytes to the presigned upload URL");
+    assert.strictEqual(mediaPutCall.body, "verify-video", "publisher media upload forwards the local video bytes");
+    assert.strictEqual(mediaPutCall.contentType, "video/mp4", "publisher media upload preserves the video content type");
+    assert.strictEqual(mediaPutCall.uploadToken, "verify", "publisher media upload forwards required upload headers");
     const eventLog = fs.readFileSync(providerEventsPath, "utf8");
     assert.ok(!eventLog.includes("publisher-secret-verify"), "provider event log redacts publisher api key");
     assert.ok(!eventLog.includes("llm-secret-verify"), "provider event log redacts llm api key");

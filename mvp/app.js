@@ -6,10 +6,17 @@ let view = initialView();
 let selectedTaskIds = new Set();
 let pendingActions = new Set();
 let dashboardFilter = "all";
+let dashboardDateRange = "today";
+let dashboardCustomStart = "";
+let dashboardCustomEnd = "";
 let storyboardEditorOpen = false;
 let storyboardEditorSceneIndex = 0;
 let copyDetailPlatformId = "";
 let lastProfileSave = null;
+let favoritesSearch = "";
+let favoritesType = "all";
+let reviewStatusFilter = "all";
+let publishDialog = null;
 
 function initialView() {
   const requested = location.hash.replace("#", "");
@@ -88,12 +95,49 @@ function statusClass(status) {
 }
 
 function reviewQueueTasks() {
-  const reviewStatuses = new Set(["content_plan_ready", "video_review", "copy_review", "ready_to_publish", "rejected"]);
+  const reviewStatuses = new Set(["content_plan_ready", "storyboard_ready", "video_generating", "video_review", "copy_review", "ready_to_publish", "rejected"]);
   return state.tasks.filter((task) => reviewStatuses.has(task.status));
 }
 
-function reviewCount(status) {
-  return state.tasks.filter((task) => task.status === status).length;
+function reviewCount(statuses) {
+  const accepted = new Set(Array.isArray(statuses) ? statuses : [statuses]);
+  return state.tasks.filter((task) => accepted.has(task.status)).length;
+}
+
+function reviewFilterOptions() {
+  return [
+    { id: "all", label: "全部待办", count: reviewQueueTasks().length, statuses: null },
+    { id: "videoGenerate", label: "待生成视频", count: reviewCount(["content_plan_ready", "storyboard_ready"]), statuses: ["content_plan_ready", "storyboard_ready"] },
+    { id: "videoReview", label: "待视频确认", count: reviewCount(["video_generating", "video_review"]), statuses: ["video_generating", "video_review"] },
+    { id: "copyReview", label: "待文案审核", count: reviewCount("copy_review"), statuses: ["copy_review"] },
+    { id: "ready", label: "待发布确认", count: reviewCount("ready_to_publish"), statuses: ["ready_to_publish"] },
+    { id: "failed", label: "生成失败", count: reviewCount("rejected"), statuses: ["rejected"] },
+  ];
+}
+
+function activeReviewFilter() {
+  return reviewFilterOptions().find((item) => item.id === reviewStatusFilter) || reviewFilterOptions()[0];
+}
+
+function reviewTasksForFilter(filter = activeReviewFilter()) {
+  const queue = reviewQueueTasks();
+  if (!filter.statuses) return queue;
+  const statuses = new Set(filter.statuses);
+  return queue.filter((task) => statuses.has(task.status));
+}
+
+function reviewFilterIdForTask(task) {
+  if (!task) return "all";
+  if (task.status === "content_plan_ready" || task.status === "storyboard_ready") return "videoGenerate";
+  if (task.status === "ready_to_publish") return "ready";
+  if (task.status === "copy_review") return "copyReview";
+  if (task.status === "video_review" || task.status === "video_generating") return "videoReview";
+  if (task.status === "rejected") return "failed";
+  return "all";
+}
+
+function syncReviewFilterForTask(task) {
+  reviewStatusFilter = reviewFilterIdForTask(task);
 }
 
 function dashboardFilterOptions(stats = Core.computeStats(state)) {
@@ -111,10 +155,76 @@ function activeDashboardFilter(stats) {
   return dashboardFilterOptions(stats).find((item) => item.id === dashboardFilter) || dashboardFilterOptions(stats)[0];
 }
 
-function dashboardTasksForFilter(filter = activeDashboardFilter()) {
-  if (!filter.statuses) return state.tasks;
+function dashboardDateRangeOptions() {
+  return [
+    { id: "today", label: "今日" },
+    { id: "3d", label: "近 3 天" },
+    { id: "7d", label: "近 7 天" },
+    { id: "all", label: "全部" },
+    { id: "custom", label: "自定义" },
+  ];
+}
+
+function dateInputValue(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function parseLocalDateInput(value, endOfDay = false) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const [, year, month, day] = match.map(Number);
+  return endOfDay
+    ? new Date(year, month - 1, day + 1, 0, 0, 0, 0)
+    : new Date(year, month - 1, day, 0, 0, 0, 0);
+}
+
+function dashboardDateBounds(rangeId = dashboardDateRange) {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (rangeId === "all") return { start: null, end: null };
+  if (rangeId === "3d") return { start: new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() - 2), end: new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() + 1) };
+  if (rangeId === "7d") return { start: new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() - 6), end: new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() + 1) };
+  if (rangeId === "custom") {
+    return {
+      start: parseLocalDateInput(dashboardCustomStart, false),
+      end: parseLocalDateInput(dashboardCustomEnd, true),
+    };
+  }
+  return { start: todayStart, end: new Date(todayStart.getFullYear(), todayStart.getMonth(), todayStart.getDate() + 1) };
+}
+
+function dashboardDateRangeLabel() {
+  if (dashboardDateRange === "custom") {
+    const start = dashboardCustomStart || "不限";
+    const end = dashboardCustomEnd || "不限";
+    return `自定义 ${start} 至 ${end}`;
+  }
+  const option = dashboardDateRangeOptions().find((item) => item.id === dashboardDateRange);
+  return option ? option.label : "今日";
+}
+
+function taskDashboardDate(task) {
+  const date = new Date(task.createdAt || task.updatedAt || 0);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function dashboardDateScopedTasks(source = state.tasks) {
+  const { start, end } = dashboardDateBounds();
+  if (!start && !end) return source;
+  return source.filter((task) => {
+    const date = taskDashboardDate(task);
+    if (!date) return false;
+    if (start && date < start) return false;
+    if (end && date >= end) return false;
+    return true;
+  });
+}
+
+function dashboardTasksForFilter(filter = activeDashboardFilter(), source = dashboardDateScopedTasks()) {
+  if (!filter.statuses) return source;
   const statuses = new Set(filter.statuses);
-  return state.tasks.filter((task) => statuses.has(task.status));
+  return source.filter((task) => statuses.has(task.status));
 }
 
 function formatTaskDate(value) {
@@ -272,13 +382,84 @@ function syncStoryboardScriptText(task, text) {
 }
 
 function listText(value) {
-  if (Array.isArray(value)) return value.filter(Boolean).join("、");
-  return String(value || "");
+  if (Array.isArray(value)) return value.map(displayText).filter(Boolean).join("、");
+  return displayText(value);
 }
 
 function copyHashtagText(value) {
   const tags = Array.isArray(value) ? value : String(value || "").split(/[，,\s#]+/).filter(Boolean);
   return tags.map((tag) => tag.startsWith("#") ? tag : `#${tag}`).join(" ");
+}
+
+function displayText(value) {
+  if (value === undefined || value === null || value === false) return "";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (typeof value === "boolean") return "";
+  if (Array.isArray(value)) return value.map(displayText).filter(Boolean).join("、");
+  if (typeof value === "object") {
+    const preferredKeys = ["text", "title", "value", "content", "label", "name", "caption", "copy"];
+    for (const key of preferredKeys) {
+      const text = displayText(value[key]);
+      if (text) return text;
+    }
+    return Object.values(value).map(displayText).filter(Boolean).join("、");
+  }
+  return String(value || "");
+}
+
+function selectedPlatformName(platformId) {
+  return Core.platforms.find((platform) => platform.id === platformId)?.name || platformId;
+}
+
+function selectedCopyGenerationLabel() {
+  const selected = state.selectedPlatforms || [];
+  if (!selected.length) return "先选择平台";
+  if (selected.length === 1) return `生成 ${selectedPlatformName(selected[0])} 文案`;
+  return `生成 ${selected.length} 个平台文案`;
+}
+
+function selectedPublishPlatformIds() {
+  const enabled = new Set((Core.publishPlatforms || Core.platforms).map((platform) => platform.id));
+  return (state.selectedPlatforms || []).filter((platformId) => enabled.has(platformId));
+}
+
+function missingSelectedCopyPlatformIds(task) {
+  if (!task || task.status !== "copy_review") return [];
+  return selectedPublishPlatformIds().filter((platformId) => !(task.copies && task.copies[platformId]));
+}
+
+function isMissingCopyReviewTask(task) {
+  return missingSelectedCopyPlatformIds(task).length > 0;
+}
+
+function enabledCopyProgress(task) {
+  const platformIds = selectedPublishPlatformIds();
+  const activePlatformIds = platformIds.length ? platformIds : (Core.publishPlatforms || Core.platforms).map((platform) => platform.id);
+  const copyIds = activePlatformIds.filter((platformId) => task.copies && task.copies[platformId]);
+  const total = activePlatformIds.length || copyIds.length;
+  const approved = activePlatformIds.filter((platformId) => task.copies && task.copies[platformId]?.approved).length;
+  return { approved, total: total || 0, copyIds, activePlatformIds };
+}
+
+function setPlatformSelected(platformId, checked) {
+  const publishPlatforms = Core.publishPlatforms || Core.platforms;
+  if (!publishPlatforms.some((platform) => platform.id === platformId)) {
+    toast("当前只支持 TikTok 发布。");
+    return false;
+  }
+  const selected = new Set(state.selectedPlatforms);
+  if (checked) {
+    selected.add(platformId);
+  } else if (selected.size > 1) {
+    selected.delete(platformId);
+  } else {
+    toast("至少保留一个发布平台。");
+    return false;
+  }
+  state.selectedPlatforms = publishPlatforms.map((platform) => platform.id).filter((id) => selected.has(id));
+  saveState();
+  renderShell();
+  return true;
 }
 
 function sanitizePublishText(text) {
@@ -322,12 +503,16 @@ function copyPublishBadge(label, type = "review") {
 }
 
 function renderSceneExtra(scene) {
+  const cameraMotion = [displayText(scene.camera), displayText(scene.motion)].filter(Boolean).join("；");
+  const generatedPrompt = [displayText(scene.imagePrompt), displayText(scene.videoPrompt)].filter(Boolean).join(" / ");
+  const screenText = displayText(scene.screenText);
+  const productFocus = displayText(scene.productFocus);
   const extras = [
-    scene.camera || scene.motion ? ["运镜", [scene.camera, scene.motion].filter(Boolean).join("；")] : null,
-    scene.voiceover ? ["旁白", scene.voiceover] : null,
-    scene.screenText ? ["屏幕字", scene.screenText] : null,
-    scene.productFocus ? ["产品重点", scene.productFocus] : null,
-    scene.imagePrompt || scene.videoPrompt ? ["生成提示词", [scene.imagePrompt, scene.videoPrompt].filter(Boolean).join(" / ")] : null,
+    cameraMotion ? ["运镜", cameraMotion] : null,
+    displayText(scene.voiceover) ? ["旁白", displayText(scene.voiceover)] : null,
+    screenText ? ["屏幕字", screenText] : null,
+    productFocus ? ["产品重点", productFocus] : null,
+    generatedPrompt ? ["生成提示词", generatedPrompt] : null,
     scene.reviewChecklist?.length ? ["审核点", listText(scene.reviewChecklist)] : null,
     scene.riskNotes?.length ? ["风险", listText(scene.riskNotes)] : null,
   ].filter(Boolean);
@@ -422,6 +607,36 @@ function latestProviderPreview(task) {
   });
 }
 
+function renderOperatorIssue(issue, options = {}) {
+  if (!issue || !issue.title) return "";
+  const raw = options.showRaw && issue.rawMessage ? `<small title="${h(issue.rawMessage)}">原始信息：${h(issue.rawMessage)}</small>` : "";
+  return `
+    <div class="operator-issue ${h(issue.category || "unknown")}">
+      <strong>${h(issue.title)}</strong>
+      <p>${h(issue.reason || "")}</p>
+      <em>${h(issue.action || "")}</em>
+      ${raw}
+    </div>
+  `;
+}
+
+function taskVideoOperatorIssue(task) {
+  if (!task) return null;
+  const responses = task.providerResponses || {};
+  if (task.status === "rejected") {
+    return Core.explainProviderIssue(responses.videoStatus || responses.video || task.reviewNote || task.video || "", { kind: "video", status: task.status });
+  }
+  if (task.status === "video_generating") {
+    return Core.explainProviderIssue(responses.videoStatus || responses.video || task.video || { status: "PENDING" }, { kind: "video", status: task.status });
+  }
+  return null;
+}
+
+function providerIssueInline(value, context = {}) {
+  const issue = Core.explainProviderIssue(value, context);
+  return [issue.title, issue.action].filter(Boolean).join("：");
+}
+
 function navIcon(name) {
   const icons = {
     video: '<path d="M4 7.5A2.5 2.5 0 0 1 6.5 5h7A2.5 2.5 0 0 1 16 7.5v9A2.5 2.5 0 0 1 13.5 19h-7A2.5 2.5 0 0 1 4 16.5z"/><path d="m16 10 4-2.5v9L16 14z"/>',
@@ -440,6 +655,7 @@ function renderShell() {
     ["dashboard", "视频", "video"],
     ["create", "新建", "create"],
     ["reverse", "反推", "reverse"],
+    ["favorites", "收藏", "favorites"],
     ["review", "审核", "review"],
     ["publish", "发布", "publish"],
     ["settings", "设置", "settings"],
@@ -520,6 +736,33 @@ async function callProvider(kind, providerRequest) {
   const data = await response.json();
   if (!response.ok || data.ok === false) {
     throw new Error(data.error || `provider ${kind} failed`);
+  }
+  return data;
+}
+
+async function uploadTaskMediaToPublisher(task) {
+  if (!isServerMode()) {
+    throw new Error("上传 PostEverywhere 媒体需要通过 http://127.0.0.1:4188 打开本地服务。");
+  }
+  const video = task && task.video || {};
+  const sourceUrl = video.localUrl || video.url;
+  if (!sourceUrl) {
+    throw new Error("当前任务没有可上传的视频。");
+  }
+  const response = await fetch("/api/publisher/media-upload", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      endpoint: state.integrations.publisher.endpoint,
+      apiKey: state.integrations.publisher.apiKey,
+      sourceUrl,
+      filename: video.fileName || `${task.id}.mp4`,
+      contentType: video.mimeType || "video/mp4",
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || "PostEverywhere 媒体上传失败");
   }
   return data;
 }
@@ -645,6 +888,9 @@ async function callProviderStream(kind, providerRequest, onEvent) {
     throw error;
   }
   if (finalEvent && finalEvent.upstream) {
+    if (finalEvent.upstream.ok === false) {
+      throw new Error(finalEvent.error || `provider ${kind} failed`);
+    }
     return {
       ok: finalEvent.upstream.ok,
       mode: "http",
@@ -782,20 +1028,34 @@ function renderView() {
 
 function renderDashboard() {
   pruneSelectedTasks();
-  const stats = Core.computeStats(state);
+  const dateScopedTasks = dashboardDateScopedTasks();
+  const stats = Core.computeStats(Object.assign({}, state, { tasks: dateScopedTasks }));
   const filterOptions = dashboardFilterOptions(stats);
   const filter = activeDashboardFilter(stats);
-  const visibleTasks = dashboardTasksForFilter(filter);
+  const visibleTasks = dashboardTasksForFilter(filter, dateScopedTasks);
   const selected = selectedTasks(visibleTasks);
   const selectedCount = selected.length;
   const canGenerateCount = selected.filter((task) => ["content_plan_ready", "storyboard_ready", "rejected"].includes(task.status)).length;
   const canRefreshCount = selected.filter((task) => task.status === "video_generating").length;
   const allSelected = visibleTasks.length > 0 && selectedCount === visibleTasks.length;
+  const customStart = dashboardCustomStart || dateInputValue();
+  const customEnd = dashboardCustomEnd || dateInputValue();
   return `
     <section>
       <div class="section-head">
         <div><h1>视频任务看板</h1><p class="muted">从真实内容规划开始，追踪视频生成、审核、文案和发布状态。</p></div>
         <button class="button primary" data-view="create">新建内容规划</button>
+      </div>
+      <div class="dashboard-date-bar" aria-label="任务时间筛选">
+        <div class="segmented-control">
+          ${dashboardDateRangeOptions().map((item) => `
+            <button class="segment ${dashboardDateRange === item.id ? "active" : ""}" data-dashboard-date-range="${item.id}" type="button" aria-pressed="${dashboardDateRange === item.id ? "true" : "false"}">${h(item.label)}</button>
+          `).join("")}
+        </div>
+        <div class="date-inputs">
+          <label>开始 <input class="summary-control" type="date" data-dashboard-date-field="start" value="${h(customStart)}" /></label>
+          <label>结束 <input class="summary-control" type="date" data-dashboard-date-field="end" value="${h(customEnd)}" /></label>
+        </div>
       </div>
       <div class="stats">
         ${filterOptions.map((item) => `
@@ -809,6 +1069,7 @@ function renderDashboard() {
         <div class="panel-head">
           <h2>任务列表</h2>
           <div class="actions">
+            <span class="tag">日期：${h(dashboardDateRangeLabel())}</span>
             ${filter.id !== "all" ? `<span class="tag">筛选：${filter.label}</span>` : ""}
             ${selectedCount ? `<span class="tag">已选 ${selectedCount} 条</span>` : `<span class="tag">${visibleTasks.length} 条任务</span>`}
           </div>
@@ -882,10 +1143,7 @@ function planArrayValue(value) {
   return readablePlanValue(value);
 }
 
-function contentPlanText(task) {
-  if (!task || !task.contentPlan) return "";
-  if (String(task.contentPlanText || "").trim()) return String(task.contentPlanText);
-  const plan = task.contentPlan;
+function contentPlanTextFromPlan(plan) {
   const sections = [
     ["产品理解", plan.productUnderstanding],
     ["目标用户", plan.targetAudience],
@@ -905,6 +1163,13 @@ function contentPlanText(task) {
     ["合规提醒", planArrayValue(plan.complianceNotes)],
   ].filter(([, value]) => String(value || "").trim());
   return sections.map(([label, value]) => `# ${label}\n${readablePlanValue(value)}`).join("\n\n");
+}
+
+function contentPlanText(task) {
+  if (!task || !task.contentPlan) return "";
+  const savedText = String(task.contentPlanText || "").trim();
+  if (savedText && !savedText.includes("[object Object]")) return savedText;
+  return contentPlanTextFromPlan(task.contentPlan);
 }
 
 function displayContentPlanStreamState(value) {
@@ -1016,37 +1281,6 @@ function renderStoryboardScriptEditor(task, streamState, actionsHtml = "") {
   `;
 }
 
-function renderCreateStoryboardPreview(task) {
-  if (!task || !Array.isArray(task.storyboard) || !task.storyboard.length) return "";
-  return `
-    <div class="create-storyboard-preview">
-      <div class="editor-head">
-        <div>
-          <strong>已生成分镜</strong>
-          <span class="muted">先在当前页检查镜头内容，确认后再进入审核生成视频。</span>
-        </div>
-        <span class="status success">${task.storyboard.length} 镜</span>
-      </div>
-      <div class="storyboard-read-list">
-        <div class="storyboard-read-head">
-          <span>时间</span>
-          <span>镜头标题</span>
-          <span>画面描述</span>
-          <span>字幕</span>
-        </div>
-        <div class="storyboard-list">${task.storyboard.map((scene, index) => `
-          <article class="storyboard-read-row">
-            <strong>${h(scene.time)}</strong>
-            <span>${h(scene.title)}</span>
-            <p>${h(scene.visual)}${renderSceneExtra(scene)}</p>
-            <em>${h(scene.subtitle)}<button class="inline-edit-button" data-action="open-storyboard-editor" data-storyboard-index="${index}">编辑第 ${index + 1} 镜</button></em>
-          </article>
-        `).join("")}</div>
-      </div>
-    </div>
-  `;
-}
-
 function storyboardPresetValue(contentBrief) {
   const count = contentBrief.storyboardSceneCount || "auto";
   const detail = contentBrief.storyboardDetailLevel || "detailed";
@@ -1082,12 +1316,24 @@ function renderCreationStrategyOptions(value) {
 function renderVideoBatchControls(contentBrief) {
   const batchCount = Math.max(1, Math.min(Number(contentBrief.videoBatchCount || 1), 10));
   const strategy = contentBrief.videoCreationStrategy || "original";
+  const resolution = ["480p", "720p", "1080p"].includes(String(contentBrief.videoResolution || "").toLowerCase())
+    ? String(contentBrief.videoResolution).toLowerCase()
+    : "720p";
   const countOption = (count) => `<option value="${count}" ${batchCount === count ? "selected" : ""}>${count} 条</option>`;
+  const resolutionOption = (value, label) => `<option value="${value}" ${resolution === value ? "selected" : ""}>${label}</option>`;
   return `
     <label class="storyboard-inline-settings">
       <span>生成数量</span>
       <select data-field="contentBrief.videoBatchCount">
         ${Array.from({ length: 10 }, (_, index) => index + 1).map(countOption).join("")}
+      </select>
+    </label>
+    <label class="storyboard-inline-settings">
+      <span>清晰度</span>
+      <select data-field="contentBrief.videoResolution">
+        ${resolutionOption("480p", "480p")}
+        ${resolutionOption("720p", "720p")}
+        ${resolutionOption("1080p", "1080p")}
       </select>
     </label>
     <label class="storyboard-inline-settings">
@@ -1172,7 +1418,6 @@ function renderCreate() {
             <div class="panel-body stack">
               ${renderContentPlanEditor(latestPlan, streamState, contentPlanActions)}
               ${renderStoryboardScriptEditor(latestPlan, storyboardStream, storyboardActions)}
-              ${renderCreateStoryboardPreview(latestPlan)}
             </div>
           </div>
         </div>
@@ -1188,10 +1433,9 @@ function renderReverseSceneRows(result) {
         <div class="editor-title-row">
           <div>
             <strong>可编辑中文反推脚本</strong>
-            <p class="muted">上传视频并点击反推后，这里会展示适合后续视频生成复用的中文脚本。</p>
           </div>
         </div>
-        <textarea rows="18" data-reverse-script-text disabled placeholder="反推完成后会生成一整段中文脚本，强调最大程度复刻原视频的画面、文案、语音、镜头角度和动作节奏。"></textarea>
+        <textarea rows="18" data-reverse-script-text disabled placeholder="反推完成后会生成一整段中文脚本。"></textarea>
       </div>
     `;
   }
@@ -1202,7 +1446,6 @@ function renderReverseSceneRows(result) {
         <div class="editor-title-row">
           <div>
             <strong>可编辑中文反推脚本</strong>
-            <span class="muted">直接改这一整段中文；二创生成会按这里最大程度复刻原视频的文案、语音、角度和节奏。</span>
           </div>
         </div>
         <textarea rows="24" data-reverse-script-text placeholder="反推完成后会生成一整段中文脚本。">${h(scriptText)}</textarea>
@@ -1222,12 +1465,11 @@ function renderReverse() {
   const selectedFavorite = reverse.selectedFavoriteId ? Core.getById(state.favorites, reverse.selectedFavoriteId) : null;
   const selectedProductId = reverse.selectedProductId || state.selectedProductId;
   const selectedProduct = Core.getById(state.products, selectedProductId) || Core.getById(state.products, state.selectedProductId);
-  const selectedProductHasMaterial = Boolean(selectedProduct && (selectedProduct.imageUrl || selectedProduct.imageData));
   const selectedProductUploadLabel = selectedProduct && selectedProduct.imageData ? `已上传：${selectedProduct.imageLabel || "本地图片"}` : "上传产品图";
   return `
     <section class="reverse-screen stack">
       <div class="section-head">
-        <div><h1>视频反推分镜</h1><p class="muted">上传参考视频，抽取关键帧后反推出可复用的分镜脚本，再保存到我的收藏用于二创。</p></div>
+        <div><h1>视频反推分镜</h1></div>
         <div class="actions">
           <button class="button" data-view="settings">接口设置</button>
           <button class="button primary" data-action="reverse-storyboard" ${pendingAttr("reverse-storyboard", !canReverse)}>${pendingLabel("reverse-storyboard", "反推分镜", "反推中")}</button>
@@ -1239,12 +1481,12 @@ function renderReverse() {
         <div class="panel">
           <div class="panel-head"><h2>参考视频</h2><span class="status ${upload ? "success" : "warning"}">${upload ? "已上传" : "等待上传"}</span></div>
           <div class="panel-body stack">
-            <label class="reverse-uploader">
-              <input type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" data-file="reverse-video" hidden />
-              <strong>${upload ? h(upload.fileName) : "上传参考视频"}</strong>
-              <span>${upload ? `${Math.round((upload.size || 0) / 1024 / 1024 * 10) / 10} MB` : "支持 mp4、mov、webm。上传需要通过本地服务打开。"}</span>
-            </label>
-            ${upload ? `<video class="reverse-video-player" controls playsinline preload="metadata" src="${h(upload.url)}"></video>` : ""}
+            ${upload ? `<video class="reverse-video-player" controls playsinline preload="metadata" src="${h(upload.url)}"></video>` : `
+              <label class="reverse-uploader">
+                <input type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" data-file="reverse-video" hidden />
+                <strong>上传参考视频</strong>
+              </label>
+            `}
             <div class="field">
               <label>反推备注</label>
               <textarea data-field="reverseVideo.notes" rows="4" placeholder="例如：保留原视频节奏，后续替换成我的产品；重点拆开头钩子和转化收尾。">${h(reverse.notes || "")}</textarea>
@@ -1253,20 +1495,14 @@ function renderReverse() {
         </div>
 
         <aside class="panel">
-          <div class="panel-head"><h2>处理状态</h2><span class="tag">${h(reverse.status || "idle")}</span></div>
+          <div class="panel-head"><h2>二创设置</h2></div>
           <div class="panel-body stack">
             <div class="settings-summary">
-              <div><span>关键帧</span><strong>${(reverse.frames || []).length} 张</strong></div>
               <div>
                 <span>二创产品</span>
                 <select class="summary-control" data-field="reverseVideo.selectedProductId">
                   ${state.products.map((product) => `<option value="${h(product.id)}" ${product.id === (selectedProduct && selectedProduct.id) ? "selected" : ""}>${h(product.name || product.imageLabel || "产品")}</option>`).join("")}
                 </select>
-              </div>
-              <div><span>产品素材</span><strong>${selectedProductHasMaterial ? "已配置" : "未配置"}</strong></div>
-              <div>
-                <span>产品名称</span>
-                <input class="summary-control" data-product-field="name" data-product-id="${h(selectedProduct && selectedProduct.id || "")}" value="${h(selectedProduct && selectedProduct.name || "")}" placeholder="例如：可折叠挂脖风扇" />
               </div>
               <div>
                 <span>图片 URL</span>
@@ -1279,7 +1515,6 @@ function renderReverse() {
                   <input type="file" accept="image/*" data-file="product-image" data-product-id="${h(selectedProduct && selectedProduct.id || "")}" hidden />
                 </label>
               </div>
-              <div><span>收藏</span><strong>${selectedFavorite ? selectedFavorite.name : "未保存"}</strong></div>
               <div>
                 <span>二创数量</span>
                 <input class="summary-control" type="number" min="1" max="10" step="1" data-field="reverseVideo.secondaryCount" value="${h(secondaryCount)}" />
@@ -1300,8 +1535,7 @@ function renderReverse() {
 
       <div class="panel">
         <div class="panel-head">
-          <div><h2>反推结果</h2><p class="muted">${result ? h([result.title, result.summary].filter(Boolean).join(" · ")) : "结果会自动保存，可以先人工修改再收藏。"}</p></div>
-          ${result?.hook ? `<span class="tag">${h(result.hook)}</span>` : ""}
+          <div><h2>反推结果</h2></div>
         </div>
         <div class="panel-body">
           ${renderReverseSceneRows(result)}
@@ -1311,109 +1545,318 @@ function renderReverse() {
   `;
 }
 
+function favoriteExcerpt(favorite, max = 180) {
+  const text = String(favorite && favorite.content || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function favoriteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function favoriteLibraryStats(favorites) {
+  const items = Array.isArray(favorites) ? favorites : [];
+  const typeCount = (pattern) => items.filter((favorite) => pattern.test(String(favorite.type || ""))).length;
+  return {
+    total: items.length,
+    storyboard: typeCount(/分镜/),
+    plan: typeCount(/内容|策划|规划/),
+    video: typeCount(/视频/),
+    reuse: items.reduce((sum, favorite) => sum + favoriteNumber(favorite.reuseCount), 0),
+  };
+}
+
+function favoriteUseProfile(favorite) {
+  const type = String(favorite?.type || "");
+  const tags = Array.isArray(favorite?.tags) ? favorite.tags.join(" ") : "";
+  const content = String(favorite?.content || "");
+  const text = `${type} ${tags} ${content}`;
+  if (/视频/.test(type)) {
+    return {
+      label: "视频任务",
+      intent: "适合回看生成结果、复盘素材来源，或作为下一条内容规划的参考。",
+      primaryLabel: "带入新建规划",
+      secondaryLabel: "查看任务看板",
+      secondaryView: "dashboard",
+    };
+  }
+  if (/内容|策划|规划/.test(type)) {
+    return {
+      label: "内容规划",
+      intent: "适合复用受众、卖点、开头和转化逻辑，继续生成新的分镜。",
+      primaryLabel: "带入新建规划",
+      secondaryLabel: "去生成分镜",
+      secondaryView: "create",
+    };
+  }
+  if (/反推|复刻|原片|视频拆解/.test(text)) {
+    return {
+      label: "反推分镜",
+      intent: "适合保留原视频节奏、镜头和转化结构，再替换成当前产品做二创。",
+      primaryLabel: "进入反推二创",
+      primaryAction: "use-favorite-for-reverse",
+      secondaryLabel: "带入新建规划",
+      secondaryAction: "use-favorite-for-create",
+    };
+  }
+  return {
+    label: "分镜脚本",
+    intent: "适合直接复用镜头顺序、口播节奏和画面提示，再进入审核生成视频。",
+    primaryLabel: "带入新建规划",
+    secondaryLabel: "进入反推二创",
+    secondaryAction: "use-favorite-for-reverse",
+  };
+}
+
+function favoriteReferenceText(favorite) {
+  if (!favorite) return "";
+  const body = favoriteExcerpt(favorite, 1200);
+  return [
+    `参考收藏：${favorite.name || "未命名收藏"}`,
+    `收藏类型：${favorite.type || "未分类"}`,
+    body,
+  ].filter(Boolean).join("\n");
+}
+
+function favoriteActionButton(favorite, profile, slot = "primary") {
+  if (!favorite) return "";
+  const action = slot === "secondary" ? profile.secondaryAction : profile.primaryAction;
+  const viewTarget = slot === "secondary" ? profile.secondaryView : profile.primaryView;
+  const label = slot === "secondary" ? profile.secondaryLabel : profile.primaryLabel;
+  const buttonClass = slot === "primary" ? "button primary" : "button";
+  if (action) {
+    return `<button class="${buttonClass}" data-action="${h(action)}" data-favorite-id="${h(favorite.id)}">${h(label)}</button>`;
+  }
+  if (viewTarget && viewTarget !== "create") {
+    return `<button class="${buttonClass}" data-view="${h(viewTarget)}" data-use-favorite="${h(favorite.id)}">${h(label)}</button>`;
+  }
+  return `<button class="${buttonClass}" data-action="use-favorite-for-create" data-favorite-id="${h(favorite.id)}" ${viewTarget ? `data-target-view="${h(viewTarget)}"` : ""}>${h(label || "带入新建规划")}</button>`;
+}
+
 function renderFavorites() {
   const draft = state.newFavorite || { type: "分镜脚本", name: "", content: "", tags: "" };
+  const query = String(favoritesSearch || "").trim().toLowerCase();
+  const types = Array.from(new Set(state.favorites.map((favorite) => favorite.type).filter(Boolean)));
+  const visibleFavorites = state.favorites.filter((favorite) => {
+    const matchesType = favoritesType === "all" || favorite.type === favoritesType;
+    const haystack = [
+      favorite.name,
+      favorite.type,
+      favorite.content,
+      ...(Array.isArray(favorite.tags) ? favorite.tags : []),
+    ].join(" ").toLowerCase();
+    return matchesType && (!query || haystack.includes(query));
+  });
+  const stats = favoriteLibraryStats(state.favorites);
+  const defaultReusableFavorite = visibleFavorites.find((favorite) => !/视频/.test(String(favorite.type || ""))) || visibleFavorites[0] || null;
+  const selectedFavorite = (state.selectedFavoriteId && visibleFavorites.find((favorite) => favorite.id === state.selectedFavoriteId))
+    || defaultReusableFavorite
+    || state.favorites.find((favorite) => favorite.id === state.selectedFavoriteId)
+    || state.favorites[0]
+    || null;
+  const selectedProfile = favoriteUseProfile(selectedFavorite);
   return `
-    <section class="stack">
+    <section class="favorite-workbench-screen favorite-library-screen stack">
       <div class="section-head">
-        <div><h1>我的收藏</h1><p class="muted">收藏好的分镜脚本、内容策划、分镜和视频，可以直接复用或让 AI 改写后批量生成。</p></div>
-        <button class="button primary" data-view="create">用收藏生成视频</button>
+        <div><h1>收藏库</h1><p class="muted">把反推分镜、内容规划和视频任务整理成可直接复用的生产资产。</p></div>
+        <div class="actions">
+          <span class="tag">${visibleFavorites.length}/${state.favorites.length} 条</span>
+          <button class="button primary" data-action="use-favorite-for-create" ${selectedFavorite ? `data-favorite-id="${h(selectedFavorite.id)}"` : "disabled"}>带入新建规划</button>
+        </div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>新增收藏</h2><span class="status info">本地保存</span></div>
+      <div class="favorite-insight-strip">
+        <div><span>全部资产</span><strong>${stats.total}</strong></div>
+        <div><span>分镜脚本</span><strong>${stats.storyboard}</strong></div>
+        <div><span>内容规划</span><strong>${stats.plan}</strong></div>
+        <div><span>视频任务</span><strong>${stats.video}</strong></div>
+        <div><span>累计复用</span><strong>${stats.reuse}</strong></div>
+      </div>
+      <div class="panel favorite-command-bar favorite-library-toolbar">
         <div class="panel-body">
           <div class="form-grid">
             <div class="field">
-              <label>类型</label>
-              <select data-field="newFavorite.type">
-                <option ${draft.type === "分镜脚本" ? "selected" : ""}>分镜脚本</option>
-                <option ${draft.type === "内容策划" ? "selected" : ""}>内容策划</option>
-              </select>
+              <label>搜索</label>
+              <input data-favorites-search value="${h(favoritesSearch)}" placeholder="搜索名称、标签、内容" />
             </div>
             <div class="field">
-              <label>名称</label>
-              <input data-field="newFavorite.name" value="${h(draft.name)}" placeholder="例如：喝水等待痛点开场" />
+              <label>类型</label>
+              <select data-favorites-type>
+                <option value="all" ${favoritesType === "all" ? "selected" : ""}>全部类型</option>
+                ${types.map((type) => `<option value="${h(type)}" ${favoritesType === type ? "selected" : ""}>${h(type)}</option>`).join("")}
+              </select>
             </div>
-            <div class="field full">
-              <label>内容</label>
-              <textarea data-field="newFavorite.content" placeholder="粘贴你认为值得复用的分镜脚本或策划。">${h(draft.content)}</textarea>
-            </div>
-            <div class="field full">
-              <label>标签</label>
-              <input data-field="newFavorite.tags" value="${h(draft.tags)}" placeholder="痛点开场, UGC, 产品演示" />
-            </div>
-          </div>
-          <div class="actions" style="margin-top:12px;">
-            <button class="button primary" data-action="add-favorite">保存到我的收藏</button>
           </div>
         </div>
       </div>
-      <div class="grid three">
-        ${state.favorites.map(fav => `
-          <article class="favorite-card">
-            <div class="favorite-card-head">
-              <div class="actions"><span class="tag">${fav.type}</span><span class="status success">评分 ${fav.score}</span><span class="status info">复用 ${fav.reuseCount}</span></div>
-              <button class="icon-button heart-button active" data-action="unfavorite" data-favorite-id="${fav.id}" title="取消收藏" aria-label="取消收藏 ${h(fav.name)}"><span>♥</span></button>
+      <div class="favorite-workbench-layout favorite-library-layout">
+        <div class="panel favorite-asset-list-panel">
+          <div class="panel-head">
+            <div><h2>收藏资产</h2><p class="muted">按用途扫描，先选资产，再决定下一步。</p></div>
+            <span class="status info">${h(favoritesType === "all" ? "全部类型" : favoritesType)}</span>
+          </div>
+          <div class="panel-body">
+            ${visibleFavorites.length ? `
+              <div class="favorite-asset-list">
+                ${visibleFavorites.map(fav => {
+                  const profile = favoriteUseProfile(fav);
+                  const selected = selectedFavorite && fav.id === selectedFavorite.id;
+                  return `
+                  <button class="favorite-asset-row ${selected ? "selected" : ""}" data-action="select-favorite" data-favorite-id="${h(fav.id)}" type="button" aria-pressed="${selected ? "true" : "false"}">
+                    <div class="favorite-asset-main">
+                      <div class="favorite-row-kicker">
+                        <span class="tag">${h(profile.label)}</span>
+                        <span class="status success">评分 ${h(favoriteNumber(fav.score, 0))}</span>
+                        <span class="status info">复用 ${h(favoriteNumber(fav.reuseCount, 0))}</span>
+                      </div>
+                      <strong>${h(fav.name)}</strong>
+                      <p>${h(favoriteExcerpt(fav, 150))}</p>
+                    </div>
+                    <div class="favorite-asset-side">
+                      <span>${h(fav.type || "未分类")}</span>
+                      <small>${h((fav.tags || []).slice(0, 3).join(" / ") || "未打标签")}</small>
+                    </div>
+                  </button>
+                `}).join("")}
+              </div>
+            ` : `
+              <div class="empty-inline">
+                <strong>还没有收藏内容</strong>
+                <p class="muted">你可以在反推分镜、内容规划和视频审核页点击收藏按钮，把好用的脚本保存到这里。</p>
+              </div>
+            `}
+          </div>
+        </div>
+        <aside class="favorite-usage-panel stack">
+          <div class="panel">
+            <div class="panel-head">
+              <div><h2>资产用法</h2><p class="muted">选中收藏后，直接进入对应生产步骤。</p></div>
+              ${selectedFavorite ? `<span class="tag">${h(selectedProfile.label)}</span>` : ""}
             </div>
-            <h2>${h(fav.name)}</h2>
-            <p>${h(fav.content)}</p>
-            <div class="chips">${fav.tags.map(tag => `<span class="chip">${h(tag)}</span>`).join("")}</div>
-            <div class="actions">
-              <button class="button primary" data-use-favorite="${fav.id}" data-view="create">使用这个收藏</button>
+            <div class="panel-body stack">
+              ${selectedFavorite ? `
+                <div class="selected-favorite favorite-usage-card">
+                  <div><span class="status success">评分 ${h(favoriteNumber(selectedFavorite.score, 0))}</span><span class="status info">复用 ${h(favoriteNumber(selectedFavorite.reuseCount, 0))}</span></div>
+                  <h3>${h(selectedFavorite.name)}</h3>
+                  <p>${h(selectedProfile.intent)}</p>
+                  <div class="favorite-next-actions">
+                    <strong>下一步动作</strong>
+                    <div class="actions">
+                      ${favoriteActionButton(selectedFavorite, selectedProfile, "primary")}
+                      ${favoriteActionButton(selectedFavorite, selectedProfile, "secondary")}
+                    </div>
+                  </div>
+                  <div class="favorite-content-brief">
+                    <span>内容线索</span>
+                    <p>${h(favoriteExcerpt(selectedFavorite, 260))}</p>
+                  </div>
+                  <div class="chips">${(selectedFavorite.tags || []).map(tag => `<span class="chip">${h(tag)}</span>`).join("")}</div>
+                  <div class="actions">
+                    <button class="button danger ghost-danger" data-action="unfavorite" data-favorite-id="${h(selectedFavorite.id)}">取消收藏</button>
+                  </div>
+                </div>
+              ` : `
+                <div class="empty-inline"><strong>暂无可用收藏</strong><p class="muted">新增或保存收藏后，会在这里给出最合适的下一步。</p></div>
+              `}
             </div>
-          </article>
-        `).join("")}
+          </div>
+          <details class="panel favorite-add-panel">
+            <summary>新增收藏</summary>
+            <div class="panel-body">
+              <div class="form-grid">
+                <div class="field">
+                  <label>类型</label>
+                  <select data-field="newFavorite.type">
+                    <option ${draft.type === "分镜脚本" ? "selected" : ""}>分镜脚本</option>
+                    <option ${draft.type === "内容策划" ? "selected" : ""}>内容策划</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>名称</label>
+                  <input data-field="newFavorite.name" value="${h(draft.name)}" placeholder="例如：痛点开场模板" />
+                </div>
+                <div class="field full">
+                  <label>内容</label>
+                  <textarea data-field="newFavorite.content" rows="5" placeholder="粘贴你认为值得复用的分镜脚本或策划。">${h(draft.content)}</textarea>
+                </div>
+                <div class="field full">
+                  <label>标签</label>
+                  <input data-field="newFavorite.tags" value="${h(draft.tags)}" placeholder="痛点开场, UGC, 产品演示" />
+                </div>
+              </div>
+              <div class="actions" style="margin-top:12px;">
+                <button class="button primary" data-action="add-favorite">保存到我的收藏</button>
+              </div>
+            </div>
+          </details>
+        </aside>
       </div>
     </section>
   `;
 }
 
 function renderReview() {
-  const queue = reviewQueueTasks();
-  const task = queue.find((item) => item.id === state.selectedTaskId) || selectedTask();
-  const stats = [
-    ["待视频审核", reviewCount("video_review")],
-    ["待文案审核", reviewCount("copy_review")],
-    ["待发布确认", reviewCount("ready_to_publish")],
-    ["生成失败", reviewCount("rejected")],
-  ];
-  if (!task) return emptyState("还没有可审核任务", "先批量生成一组分镜任务。", "create");
+  const allQueue = reviewQueueTasks();
+  const activeFilter = activeReviewFilter();
+  const queue = reviewTasksForFilter(activeFilter);
+  const selectedReviewTask = allQueue.find((item) => item.id === state.selectedTaskId);
+  const task = queue.find((item) => item.id === state.selectedTaskId) || selectedReviewTask || queue[0] || null;
+  if (!allQueue.length) return emptyState("还没有可审核任务", "先批量生成一组分镜任务。", "create");
   return `
     <section class="review-screen">
       <div class="section-head">
         <div><h1>审核中心</h1><p class="muted">全局审核所有需要人工处理的视频、文案、发布确认和失败任务。</p></div>
         <div class="actions">
-          <span class="tag">${queue.length} 条待处理</span>
+          <span class="tag">${allQueue.length} 条待处理</span>
           <button class="button" data-view="dashboard">返回看板</button>
         </div>
       </div>
 
       <div class="review-stats">
-        ${stats.map(([label, count]) => `<div class="stat"><span>${label}</span><strong>${count}</strong></div>`).join("")}
+        ${reviewFilterOptions().map((filter) => `
+          <button class="stat review-stat-filter ${activeFilter.id === filter.id ? "active" : ""}" data-review-filter="${filter.id}" type="button" aria-pressed="${activeFilter.id === filter.id ? "true" : "false"}">
+            <span>${h(filter.label)}</span>
+            <strong>${h(filter.count)}</strong>
+          </button>
+        `).join("")}
       </div>
 
-      <div class="review-center">
-        <div class="review-queue panel">
+      <div class="review-center review-triage-board">
+        <div class="review-worklist-panel review-queue panel">
           <div class="panel-head">
-            <div><h2>审核队列</h2><p class="muted">先扫全局待办，再进入右侧逐条确认。</p></div>
-            <span class="tag">${state.tasks.length} 条任务</span>
+            <div><h2>审核队列</h2><p class="muted">先看阶段和卡点，再处理行尾主操作。</p></div>
+            <span class="tag">${activeFilter.label} · ${queue.length} 条</span>
           </div>
           <div class="panel-body">
             ${queue.length ? `
-              <div class="review-task-list">
-                ${queue.map((item) => renderReviewQueueItem(item, item.id === task.id)).join("")}
+              <div class="review-worklist">
+                <div class="review-worklist-head">
+                  <span>阶段</span>
+                  <span>任务</span>
+                  <span>当前卡点</span>
+                  <span>更新</span>
+                  <span>主操作</span>
+                </div>
+                ${queue.map((item) => renderReviewQueueItem(item, task && item.id === task.id)).join("")}
               </div>
             ` : `
               <div class="empty-inline">
-                <strong>暂无待人工审核任务</strong>
-                <p class="muted">视频、文案、发布确认或失败任务出现后会集中在这里。</p>
+                <strong>这个状态下暂无任务</strong>
+                <p class="muted">点击上方其它状态卡片切换审核队列。</p>
               </div>
             `}
           </div>
         </div>
 
         <div class="review-detail">
-          ${renderReviewDetail(task)}
+          ${task ? renderReviewDetail(task) : `
+            <div class="panel">
+              <div class="panel-body empty-inline">
+                <strong>请选择其它状态</strong>
+                <p class="muted">当前筛选没有可审核任务。</p>
+              </div>
+            </div>
+          `}
         </div>
       </div>
     </section>
@@ -1421,27 +1864,250 @@ function renderReview() {
 }
 
 function renderReviewQueueItem(task, active) {
-  const copyCount = Object.values(task.copies || {}).length;
-  const approvedCopyCount = Object.values(task.copies || {}).filter((copy) => copy.approved).length;
+  const copyProgress = enabledCopyProgress(task);
+  const missingCopy = isMissingCopyReviewTask(task);
+  const canApprove = task.video && task.status === "video_review";
+  const isGenerating = task.status === "video_generating";
+  const isFailed = task.status === "rejected";
+  const decision = reviewDecisionModel(task, canApprove, isGenerating, isFailed);
+  const stage = reviewQueueStage(task, missingCopy);
   const note = task.status === "rejected"
     ? task.reviewNote || task.video?.providerMessage || "需要重新生成视频"
     : task.status === "copy_review"
-      ? `${approvedCopyCount}/${copyCount || state.selectedPlatforms.length} 平台文案已审核`
+      ? missingCopy ? "文案已被移除，需要重新生成" : `${copyProgress.approved}/${copyProgress.total || state.selectedPlatforms.length} 平台文案已审核`
       : task.status === "ready_to_publish"
         ? "文案已审核，等待发布确认"
-        : task.video?.url ? "视频已生成，等待人工确认" : "等待视频结果";
+        : task.status === "content_plan_ready" || task.status === "storyboard_ready"
+          ? "分镜已就绪，下一步生成视频"
+          : task.video?.url ? "视频已生成，等待人工确认" : "等待视频结果";
   return `
-    <article class="review-task-card ${active ? "active" : ""}">
-      <button class="review-task-button" data-select-task="${task.id}" data-view="review">
-        <span class="review-task-thumb">${task.video?.url ? "▶" : "..."}</span>
-        <span class="review-task-copy">
-          <strong>${h(task.title)}</strong>
-          <small>${h(task.productName)} · ${h(task.favoriteName)}</small>
-          <em>${h(note)}</em>
+    <article class="review-worklist-row review-task-card ${active ? "active" : ""}">
+      <button class="review-worklist-select" data-select-task="${task.id}" data-view="review">
+        <span class="review-stage-cell">
+          <strong>${h(stage.label)}</strong>
+          <small>${h(stage.detail)}</small>
         </span>
-        <span class="status ${statusClass(task.status)}">${Core.taskStatusLabel(task.status)}</span>
+        <span class="review-title-cell">
+          <strong title="${h(task.title)}">${h(task.title)}</strong>
+          <small>${h(task.productName)} · ${h(task.favoriteName || "未使用收藏")}</small>
+        </span>
+        <span class="review-blocker-cell">
+          <em>${h(decision.title)}</em>
+          <small>${h(note)}</small>
+        </span>
+        <span class="review-updated-cell">${h(formatTaskDate(task.updatedAt || task.createdAt))}</span>
       </button>
+      <div class="review-row-actions">
+        ${reviewQueueActionButton(decision.primary, task)}
+        <button class="icon-button review-task-delete" data-action="delete-task" data-task-id="${task.id}" title="删除任务" aria-label="删除任务 ${h(task.title)}">×</button>
+      </div>
     </article>
+  `;
+}
+
+function reviewQueueStage(task, missingCopy = false) {
+  if (task.status === "rejected") return { label: "生成失败", detail: "需要处理异常" };
+  if (task.status === "video_generating") return { label: "视频生成中", detail: "等待结果" };
+  if (task.status === "video_review") return { label: "待视频确认", detail: "看完再通过" };
+  if (task.status === "copy_review") return { label: missingCopy ? "待补文案" : "待文案审核", detail: "TikTok 文案" };
+  if (task.status === "ready_to_publish") return { label: "待发布确认", detail: "账号和内容" };
+  if (task.status === "published") return { label: "已发布", detail: "流程完成" };
+  return { label: "待生成视频", detail: "内容规划已生成" };
+}
+
+function reviewQueueActionButton(action, task) {
+  const className = `button compact review-primary-action ${action.primary ? "primary" : ""}`.replace(/\s+/g, " ").trim();
+  if (action.view) {
+    return `<button class="${className}" data-select-task="${h(task.id)}" data-view="${h(action.view)}">${h(action.label)}</button>`;
+  }
+  const pendingKey = action.pendingKey || action.action;
+  const label = action.pendingText ? pendingLabel(pendingKey, action.label, action.pendingText) : h(action.label);
+  return `<button class="${className}" data-action="${h(action.action)}" data-task-id="${h(task.id)}" ${pendingAttr(pendingKey, action.disabled)}>${label}</button>`;
+}
+
+function reviewPublishSummary(task) {
+  const platformIds = selectedPublishPlatformIds();
+  const readiness = publishReadiness(task, platformIds);
+  const platformNames = readiness.activeIds.map(selectedPlatformName).join("、") || "未选择平台";
+  let label = "文案待生成";
+  let statusType = "warning";
+  if (readiness.published) {
+    label = "已发布";
+    statusType = "success";
+  } else if (readiness.ready) {
+    label = "文案已通过，待发布确认";
+    statusType = "info";
+  } else if (readiness.pending.length) {
+    label = "文案待审核";
+    statusType = "warning";
+  } else if (readiness.missing.length) {
+    label = "文案缺失";
+    statusType = "warning";
+  }
+  return {
+    label,
+    statusType,
+    platformNames,
+    readiness,
+    updated: task.updatedAt || task.createdAt,
+  };
+}
+
+function reviewStepState(step, task) {
+  if (step === "video") {
+    if (["copy_review", "ready_to_publish", "published"].includes(task.status)) return "done";
+    if (["video_review", "video_generating", "rejected"].includes(task.status)) return "current";
+    return "pending";
+  }
+  if (step === "copy") {
+    if (["ready_to_publish", "published"].includes(task.status)) return "done";
+    if (task.status === "copy_review") return "current";
+    return "pending";
+  }
+  if (step === "publish") {
+    if (task.status === "published") return "done";
+    if (task.status === "ready_to_publish") return "current";
+    return "pending";
+  }
+  return "pending";
+}
+
+function reviewActionButton(action) {
+  const className = `button ${action.primary ? "primary" : action.danger ? "danger subtle" : ""} wide`.replace(/\s+/g, " ").trim();
+  if (action.view) return `<button class="${className}" data-view="${h(action.view)}">${h(action.label)}</button>`;
+  const pendingKey = action.pendingKey || action.action;
+  const label = action.pendingText ? pendingLabel(pendingKey, action.label, action.pendingText) : h(action.label);
+  return `<button class="${className}" data-action="${h(action.action)}" ${pendingAttr(pendingKey, action.disabled)}>${label}</button>`;
+}
+
+function reviewDecisionModel(task, canApprove, isGenerating, isFailed) {
+  const summary = reviewPublishSummary(task);
+  const copyCountText = `${summary.readiness.approved}/${summary.readiness.total} 已通过`;
+  if (task.status === "rejected" || isFailed) {
+    return {
+      badge: ["danger", "生成失败"],
+      title: "重新生成视频",
+      description: task.reviewNote || task.video?.providerMessage || "视频没有生成成功。先重新生成或检查 provider 返回，再继续审核。",
+      primary: { label: "重新生成视频", action: "generate-video", primary: true, pendingText: "生成中", disabled: task.video && !isFailed },
+      secondary: { label: "查询视频结果", action: "refresh-video", pendingText: "查询中", disabled: !isGenerating },
+      summary,
+      copyCountText,
+    };
+  }
+  if (task.status === "video_generating") {
+    return {
+      badge: ["info", "视频生成中"],
+      title: "等待视频结果",
+      description: "视频任务已提交。查询到可播放视频后，再进入人工审核。",
+      primary: { label: "查询视频结果", action: "refresh-video", primary: true, pendingText: "查询中", disabled: false },
+      secondary: { label: "生成视频", action: "generate-video", pendingText: "生成中", disabled: true },
+      summary,
+      copyCountText,
+    };
+  }
+  if (task.status === "video_review") {
+    return {
+      badge: ["warning", "待视频审核"],
+      title: "先确认视频能用",
+      description: "看完视频后点击通过，系统会进入平台文案生成与审核。",
+      primary: { label: "通过并生成文案", action: "approve-video", primary: true, pendingText: "生成文案中", disabled: !canApprove },
+      secondary: { label: "查询视频结果", action: "refresh-video", pendingText: "查询中", disabled: !isGenerating },
+      summary,
+      copyCountText,
+    };
+  }
+  if (task.status === "ready_to_publish") {
+    return {
+      badge: ["info", "待发布确认"],
+      title: "最后确认发布",
+      description: "视频和文案都已通过。进入发布页检查账号、发布时间和最终提交内容。",
+      primary: { label: "去发布确认", view: "publish", primary: true },
+      secondary: { label: "刷新审核状态", action: "refresh-review-status" },
+      summary,
+      copyCountText,
+    };
+  }
+  if (task.status === "published") {
+    return {
+      badge: ["success", "已发布"],
+      title: "流程已完成",
+      description: "这个任务已经发布完成，可以在发布页查看发布结果和返回链接。",
+      primary: { label: "查看发布结果", view: "publish", primary: true },
+      secondary: { label: "返回看板", view: "dashboard" },
+      summary,
+      copyCountText,
+    };
+  }
+  if (isMissingCopyReviewTask(task)) {
+    return {
+      badge: ["warning", "待补文案"],
+      title: "补齐平台文案",
+      description: "文案已被移除，需要重新生成。补齐后再进入文案页审核，通过后才会进入发布确认。",
+      primary: { label: "重新生成文案", action: "recover-missing-copies", primary: true, pendingText: "生成中" },
+      secondary: { label: "查看文案页", view: "publish" },
+      tertiary: { label: "删除此任务", action: "delete-current-task", danger: true },
+      summary,
+      copyCountText,
+    };
+  }
+  if (task.status === "copy_review") {
+    return {
+      badge: ["warning", "文案待审核"],
+      title: "审核 TikTok 文案",
+      description: "视频已经通过。去文案页检查标题、正文和 CTA，文案通过后会自动进入发布确认。",
+      primary: { label: "查看并审核文案", view: "publish", primary: true },
+      secondary: { label: "重新生成文案", action: "generate-copies", pendingText: "生成中" },
+      summary,
+      copyCountText,
+    };
+  }
+  return {
+    badge: ["warning", Core.taskStatusLabel(task.status)],
+    title: "继续完成当前步骤",
+    description: "这个任务还没有进入发布闭环。先完成视频审核，再处理文案和发布确认。",
+    primary: { label: "生成视频", action: "generate-video", primary: true, pendingText: "生成中" },
+    secondary: { label: "刷新审核状态", action: "refresh-review-status" },
+    summary,
+    copyCountText,
+  };
+}
+
+function renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed) {
+  const decision = reviewDecisionModel(task, canApprove, isGenerating, isFailed);
+  const steps = [
+    ["video", "视频确认", "视频可播放并已留档"],
+    ["copy", "文案审核", "TikTok 文案通过"],
+    ["publish", "发布确认", "账号和内容最终确认"],
+  ];
+  return `
+    <div class="review-decision-card review-active-decision">
+      <div class="review-decision-head">
+        <span class="status ${decision.badge[0]}">${h(decision.badge[1])}</span>
+        <h3>${h(decision.title)}</h3>
+        <p>${h(decision.description)}</p>
+      </div>
+      <div class="review-flow">
+        ${steps.map(([id, label, note], index) => `
+          <div class="review-flow-step ${reviewStepState(id, task)}">
+            <span>${index + 1}</span>
+            <strong>${h(label)}</strong>
+            <small>${h(note)}</small>
+          </div>
+        `).join("")}
+      </div>
+      <div class="review-fact-grid">
+        <div><span>产品</span><strong>${h(task.productName)}</strong></div>
+        <div><span>平台</span><strong>${h(decision.summary.platformNames)}</strong></div>
+        <div><span>文案</span><strong>${h(decision.copyCountText)}</strong></div>
+        <div><span>更新</span><strong>${h(formatTaskDate(decision.summary.updated))}</strong></div>
+      </div>
+      <div class="review-decision-actions">
+        ${reviewActionButton(decision.primary)}
+        ${decision.secondary ? reviewActionButton(decision.secondary) : ""}
+        ${decision.tertiary ? reviewActionButton(decision.tertiary) : ""}
+      </div>
+      <p class="review-decision-note">${h(decision.summary.readiness.message)}</p>
+    </div>
   `;
 }
 
@@ -1452,13 +2118,8 @@ function renderReviewDetail(task) {
   const videoUrl = task.video && task.video.url ? String(task.video.url) : "";
   const canPreviewVideo = /^(https?:|blob:|data:video\/)/.test(videoUrl);
   const localVideoUrl = task.video && task.video.localUrl ? String(task.video.localUrl) : "";
-  const progress = [
-    ["分镜", true],
-    ["视频", Boolean(task.video) && !["content_plan_ready", "storyboard_ready"].includes(task.status)],
-    ["审核", !["content_plan_ready", "storyboard_ready"].includes(task.status)],
-    ["文案", ["copy_review", "ready_to_publish", "published"].includes(task.status)],
-    ["发布", task.status === "published"],
-  ];
+  const localVideoPath = task.video && task.video.localPath ? String(task.video.localPath) : "";
+  const videoIssue = taskVideoOperatorIssue(task);
   return `
       <div class="review-layout">
         <div class="review-main stack">
@@ -1471,20 +2132,19 @@ function renderReviewDetail(task) {
               <div class="video-box ${canPreviewVideo ? "has-video" : ""}">
                 ${canPreviewVideo ? `
                   <video class="video-player" controls playsinline preload="metadata" src="${h(videoUrl)}"></video>
-                  <div class="video-meta">
-                    <strong>${localVideoUrl ? "视频已保存到本地" : "视频已生成，等待审核"}</strong>
-                    <span class="video-links">
-                      ${localVideoUrl ? `<a href="${h(localVideoUrl)}" target="_blank" rel="noreferrer">打开本地视频</a>` : ""}
-                      <a href="${h(videoUrl)}" target="_blank" rel="noreferrer">打开原始视频</a>
-                      <button class="button compact ghost" data-action="download-video">下载到本地</button>
+                  <div class="video-meta video-storage-status">
+                    <span class="video-meta-copy">
+                      <strong>${localVideoUrl ? "视频已保存到本地" : "视频已生成，等待审核"}</strong>
+                      <span>${localVideoUrl ? "本地文件已可用于审核留档。" : "需要留档时可下载到本地。"}</span>
                     </span>
+                    <button class="button compact ghost" data-action="download-video">${localVideoUrl ? "重新下载" : "下载到本地"}</button>
                   </div>
-                  ${task.video?.localPath ? `<p class="video-local-path">已保存：${h(task.video.localPath)}</p>` : ""}
+                  ${localVideoPath ? `<p class="video-local-path" title="${h(localVideoPath)}"><span>本地路径</span><code>${h(localVideoPath)}</code></p>` : ""}
                 ` : `
                   <div class="video-placeholder">
                     <div class="play">▶</div>
                     <strong>${isFailed ? "视频生成失败" : task.status === "video_generating" ? "视频正在生成" : task.video && task.video.url ? "视频已生成，等待审核" : "还未生成视频"}</strong>
-                    <p>${isFailed ? h(task.reviewNote || task.video?.providerMessage || "请检查图片 URL、模型权限和接口参数后重新生成。") : task.status === "video_generating" ? h(`任务 ID：${task.video?.jobId || "等待接口返回"}。点击“查询视频结果”获取真实视频地址。`) : task.video && task.video.url ? h(task.video.url) : "点击右上角生成视频，生成完成后再审核。"}</p>
+                    ${videoIssue ? renderOperatorIssue(videoIssue, { showRaw: isFailed }) : `<p>${isFailed ? h(task.reviewNote || task.video?.providerMessage || "请检查图片 URL、模型权限和接口参数后重新生成。") : task.status === "video_generating" ? h(`任务 ID：${task.video?.jobId || "等待接口返回"}。点击“查询视频结果”获取真实视频地址。`) : task.video && task.video.url ? h(task.video.url) : "点击右上角生成视频，生成完成后再审核。"}</p>`}
                   </div>
                 `}
               </div>
@@ -1494,7 +2154,7 @@ function renderReviewDetail(task) {
           <div class="panel">
             <div class="panel-head">
               <div><h2>分镜脚本</h2><p class="muted">按时间顺序检查画面、字幕和产品卖点；生成后仍可人工修改。</p></div>
-              <div class="actions"><button class="button" data-action="open-storyboard-editor">编辑分镜</button>${favoriteHeart("storyboard")}<button class="button" data-view="publish">查看文案</button></div>
+              <div class="actions"><button class="button" data-action="open-storyboard-editor">编辑分镜</button>${favoriteHeart("storyboard")}</div>
             </div>
             <div class="panel-body">
               <div class="storyboard-read-list">
@@ -1519,20 +2179,9 @@ function renderReviewDetail(task) {
 
         <aside class="review-side stack">
           <div class="panel">
-            <div class="panel-head"><h2>审核摘要</h2></div>
-            <div class="panel-body stack">
-              <div class="review-progress">
-                ${progress.map(([label, done]) => `<span class="${done ? "done" : ""}">${label}</span>`).join("")}
-              </div>
-              <div class="settings-summary">
-                <div><span>产品</span><strong>${h(task.productName)}</strong></div>
-                <div><span>内容来源</span><strong>${h(task.contentPlan ? "产品想法 + 产品图" : task.favoriteName)}</strong></div>
-                <div><span>生成方式</span><strong>${h(Core.strategyLabel(task.strategy))}</strong></div>
-                <div><span>负责人</span><strong>${h(task.owner)}</strong></div>
-              </div>
-              <button class="button wide" data-action="generate-video" ${pendingAttr("generate-video", task.video && !isFailed)}>${pendingLabel("generate-video", "生成视频", "生成中")}</button>
-              <button class="button wide" data-action="refresh-video" ${pendingAttr("refresh-video", !isGenerating)}>${pendingLabel("refresh-video", "查询视频结果", "查询中")}</button>
-              <button class="button primary wide" data-action="approve-video" ${pendingAttr("approve-video", !canApprove)}>${pendingLabel("approve-video", "通过并生成文案", "生成文案中")}</button>
+            <div class="panel-head"><h2>当前决策</h2></div>
+            <div class="panel-body">
+              ${renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed)}
             </div>
           </div>
         </aside>
@@ -1626,16 +2275,22 @@ function renderStoryboardEditor(task) {
   `;
 }
 
-function renderCopyCard(task, platformId) {
+function renderCopyCard(task, platformId, options = {}) {
   const platform = Core.platforms.find((item) => item.id === platformId);
+  const platformName = platform?.name || platformId;
   const copy = sanitizedCopy(task.copies[platformId]);
+  const selected = state.selectedPlatforms.includes(platformId);
   const publisherResponse = task.providerResponses && task.providerResponses.publisher;
   const hasFailedRealPublish = publisherResponse && publisherResponse.ok === false;
   const result = hasFailedRealPublish ? null : task.publishResults[platformId];
   const warningCount = copy?.complianceWarnings?.length || 0;
-  return `<article class="copy-card">
+  const platformReady = copy?.approved && publishReadiness(task, [platformId]).ready;
+  const platformBlocked = copy?.approved && !platformReady;
+  const taskIdAttr = options.includeTaskId ? ` data-task-id="${h(task.id)}"` : "";
+  const regenerateKey = options.includeTaskId ? `regenerate-copy-${task.id}-${platformId}` : `regenerate-copy-${platformId}`;
+  return `<article class="copy-card selectable-copy-card ${selected ? "selected" : ""}" data-platform-card="${platformId}">
     <div class="copy-card-head">
-      <div class="actions"><span class="tag">${h(platform?.name || platformId)}</span>${copy?.approved ? `<span class="status success">已审核</span>` : `<span class="status warning">待审核</span>`}</div>
+      <div class="actions"><input type="checkbox" data-platform-toggle="${platformId}" aria-label="选择 ${h(platformName)}" ${selected ? "checked" : ""} /><span class="tag">${h(platformName)}</span>${copy ? copy.approved ? `<span class="status success">已审核</span>` : `<span class="status warning">待审核</span>` : `<span class="status muted">未生成</span>`}</div>
       ${warningCount ? `<span class="status warning">合规提醒 ${warningCount}</span>` : ""}
     </div>
     ${copy ? `
@@ -1644,13 +2299,15 @@ function renderCopyCard(task, platformId) {
       <p class="muted">${h(copy.body)}</p>
       <p class="muted">${h(copyHashtagText(copy.hashtags))}</p>
       <div class="actions">
-        <button class="button" data-action="open-copy-detail" data-platform="${platformId}">查看文案详情</button>
-        ${result ? `<a href="${result.url}" target="_blank">${h(result.platformName)} 发布链接</a>` : `<button class="button" data-action="approve-copy" data-platform="${platformId}">通过文案</button>`}
-        <button class="button subtle" data-action="delete-copy" data-platform="${platformId}">移除</button>
+        <button class="button" data-action="open-copy-detail"${taskIdAttr} data-platform="${platformId}">查看文案详情</button>
+        <button class="button" data-action="regenerate-copy"${taskIdAttr} data-platform="${platformId}" ${pendingAttr(regenerateKey)}>${pendingLabel(regenerateKey, `重新生成 ${platformName} 文案`, "生成中")}</button>
+        ${result ? `<a href="${result.url}" target="_blank">${h(result.platformName)} 发布链接</a>` : copy.approved ? `<button class="button primary" data-action="publish-copy"${taskIdAttr} data-platform="${platformId}" ${platformReady ? "" : "disabled"}>发布</button><button class="button" data-action="schedule-copy"${taskIdAttr} data-platform="${platformId}" ${platformBlocked ? "disabled" : ""}>定时</button>` : `<button class="button primary" data-action="approve-copy"${taskIdAttr} data-platform="${platformId}">通过</button>`}
+        <button class="button subtle" data-action="delete-copy"${taskIdAttr} data-platform="${platformId}">移除</button>
       </div>
     ` : `
-      <p class="muted">尚未生成文案。</p>
-      <button class="button" data-action="open-copy-detail" data-platform="${platformId}" disabled>查看文案详情</button>
+      <h3>${h(platformName)}</h3>
+      <p class="muted">点击选择后可批量生成。</p>
+      <button class="button" data-action="regenerate-copy"${taskIdAttr} data-platform="${platformId}" ${pendingAttr(regenerateKey)}>${pendingLabel(regenerateKey, `生成 ${platformName} 文案`, "生成中")}</button>
     `}
   </article>`;
 }
@@ -1684,51 +2341,24 @@ function renderCopyDetailModal(task) {
   const copy = sanitizedCopy(task.copies[copyDetailPlatformId]);
   const platform = Core.platforms.find((item) => item.id === copyDetailPlatformId);
   if (!copy) return "";
-  const previewText = finalPlatformCopy(copy);
-  const requestPreview = publisherRequestPreview(task, copyDetailPlatformId);
   return `
     <div class="modal-backdrop" role="presentation">
       <section class="copy-detail-modal" role="dialog" aria-modal="true" aria-label="文案详情">
         <div class="modal-head">
-          <div><h2>文案详情</h2><p class="muted">${h(platform?.name || copyDetailPlatformId)} · ${h(task.title)} · 输入时自动保存。</p></div>
+          <div><h2>文案详情</h2><p class="muted">${h(platform?.name || copyDetailPlatformId)} · 输入时自动保存。</p></div>
           <button class="button" data-action="close-copy-detail">完成</button>
         </div>
-        <div class="copy-detail-body">
-          <div class="platform-copy-preview">
-            <div>
-              <strong>实际发布正文</strong>
-              <span>会发送为 ${h(platform?.name || copyDetailPlatformId)} 的 content 字段</span>
+        <div class="copy-detail-body compact-copy-detail">
+          <div class="copy-detail-primary">
+            <div class="field"><label>标题</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="title" value="${h(copy.title || "")}" /></div>
+            <div class="field"><label>Hook</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="hook" value="${h(copy.hook || "")}" /></div>
+            <div class="field"><label>正文</label><textarea rows="7" data-copy-platform="${copyDetailPlatformId}" data-copy-field="body">${h(copy.body || "")}</textarea></div>
+            <div class="form-grid">
+              <div class="field"><label>CTA</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="cta" value="${h(copy.cta || "")}" /></div>
+              <div class="field"><label>Hashtags</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="hashtags" value="${h(copyHashtagText(copy.hashtags))}" /></div>
             </div>
-            <pre>${h(previewText)}</pre>
           </div>
-          <div class="platform-copy-preview">
-            <div>
-              <strong>中文参考译文</strong>
-              <span>仅用于人工审核，不会发布到平台</span>
-            </div>
-            <pre>${h(copy.chineseTranslation || "暂无中文参考译文，请重新生成文案。")}</pre>
-          </div>
-          <div class="publisher-request-preview">
-            <div>
-              <strong>PostEverywhere 请求预览</strong>
-              <span>不包含 API Key，发布前可核对真实请求体</span>
-            </div>
-            <pre>${h(JSON.stringify(requestPreview, null, 2))}</pre>
-          </div>
-          <div class="field"><label>标题 ${copyPublishBadge("会发布", "sent")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="title" value="${h(copy.title || "")}" /></div>
-          <div class="field"><label>Hook ${copyPublishBadge("会发布", "sent")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="hook" value="${h(copy.hook || "")}" /></div>
-          <div class="field"><label>正文 ${copyPublishBadge("会发布", "sent")}</label><textarea rows="5" data-copy-platform="${copyDetailPlatformId}" data-copy-field="body">${h(copy.body || "")}</textarea></div>
-          <div class="field"><label>中文参考译文 ${copyPublishBadge("仅内部审核")}</label><textarea rows="4" data-copy-platform="${copyDetailPlatformId}" data-copy-field="chineseTranslation">${h(copy.chineseTranslation || "")}</textarea></div>
-          <div class="form-grid">
-            <div class="field"><label>CTA ${copyPublishBadge("会发布", "sent")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="cta" value="${h(copy.cta || "")}" /></div>
-            <div class="field"><label>封面标题 ${copyPublishBadge("暂未接入发布", "pending")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="coverTitle" value="${h(copy.coverTitle || "")}" /></div>
-            <div class="field"><label>Hashtags ${copyPublishBadge("会发布", "sent")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="hashtags" value="${h(copyHashtagText(copy.hashtags))}" /></div>
-            <div class="field"><label>首条评论 ${copyPublishBadge("暂未接入发布", "pending")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="firstComment" value="${h(copy.firstComment || "")}" /></div>
-          </div>
-          <div class="field"><label>屏幕叠字 ${copyPublishBadge("暂未接入发布", "pending")}</label><input data-copy-platform="${copyDetailPlatformId}" data-copy-field="overlayText" value="${h(listText(copy.overlayText))}" /></div>
-          <div class="field"><label>投放建议 ${copyPublishBadge("仅内部审核")}</label><textarea rows="3" data-copy-platform="${copyDetailPlatformId}" data-copy-field="postingNotes">${h(copy.postingNotes || "")}</textarea></div>
-          <div class="field"><label>合规提醒 ${copyPublishBadge("仅内部审核")}</label><textarea rows="3" data-copy-platform="${copyDetailPlatformId}" data-copy-field="complianceWarnings">${h(listText(copy.complianceWarnings))}</textarea></div>
-          <div class="field"><label>生成理由 ${copyPublishBadge("仅内部审核")}</label><textarea rows="3" data-copy-platform="${copyDetailPlatformId}" data-copy-field="rationale">${h(copy.rationale || "")}</textarea></div>
+          <div class="field translation-reference"><label>中文翻译参考</label><textarea rows="5" data-copy-platform="${copyDetailPlatformId}" data-copy-field="chineseTranslation">${h(copy.chineseTranslation || "")}</textarea></div>
         </div>
       </section>
     </div>
@@ -1742,6 +2372,7 @@ function renderPublisherFeedback(task) {
   const upstream = response.upstream || {};
   const status = upstream.status || response.status || "";
   const error = response.error || upstream.error || "";
+  const issue = ok ? null : Core.explainProviderIssue(response, { kind: "publisher" });
   const data = upstream.data || upstream.upstream?.data || response.result || response.results || null;
   const summary = data ? JSON.stringify(redactSecrets(data), null, 2) : "";
   return `
@@ -1750,6 +2381,7 @@ function renderPublisherFeedback(task) {
         <strong>后台发布反馈</strong>
         <span>${ok ? "提交成功" : "提交失败"}${status ? ` · HTTP ${h(status)}` : ""}</span>
       </div>
+      ${issue ? renderOperatorIssue(issue, { showRaw: false }) : ""}
       ${error ? `<p>${h(error)}</p>` : ""}
       ${summary ? `<pre>${h(summary)}</pre>` : ""}
     </div>
@@ -1766,22 +2398,26 @@ function publishReadiness(task, platformIds) {
   const pending = activeIds.filter((platformId) => task.copies[platformId] && !task.copies[platformId].approved);
   const publisher = state.integrations.publisher || {};
   const accountIds = String(publisher.accountIds || publisher.account_ids || "").split(/[,\n]/).map((item) => item.trim()).filter(Boolean);
+  const mediaIds = Core.publishMediaIds(state, task, activeIds);
   const missingPublisherAccounts = publisher.mode === "http" && publisher.provider === "posteverywhere" && accountIds.length === 0;
-  const ready = approved > 0 && !pending.length && !missing.length && !missingPublisherAccounts;
+  const missingPublisherMedia = publisher.mode === "http" && publisher.provider === "posteverywhere" && activeIds.includes("tiktok") && mediaIds.length === 0;
+  const ready = approved > 0 && !pending.length && !missing.length && !missingPublisherAccounts && !missingPublisherMedia;
   const published = task.status === "published";
   let message = "当前保留的平台文案已通过，可以发布到 PostEverywhere。";
   if (published) {
-    message = "当前任务已发布，下面可查看各平台发布反馈。";
-  } else if (missingPublisherAccounts) {
-    message = "还没有配置 PostEverywhere 账号 IDs。请到设置页填写 GET /accounts 返回的 account_id，多个用逗号分隔。";
+    message = "已发布。";
   } else if (!copyIds.length) {
-    message = "还没有可发布的平台文案，请先生成平台文案。";
+    message = "还没有可发布文案。";
   } else if (missing.length) {
-    message = `还差 ${missing.length} 个平台文案未生成，请先生成平台文案。`;
+    message = `缺少 ${missing.length} 个平台文案。`;
   } else if (pending.length) {
-    message = `还差 ${pending.length} 个平台文案未通过，先逐个平台点击“通过文案”。`;
+    message = `${pending.length} 个文案待审核。`;
+  } else if (missingPublisherAccounts) {
+    message = "缺少 PostEverywhere 账号 ID。";
+  } else if (missingPublisherMedia) {
+    message = "缺少 PostEverywhere 媒体 ID。TikTok 发布必须先上传视频并填写 media_id。";
   }
-  return { total, approved, approvedIds, activeIds, missing, pending, missingPublisherAccounts, ready, published, message };
+  return { total, approved, approvedIds, activeIds, missing, pending, missingPublisherAccounts, missingPublisherMedia, ready, published, message };
 }
 
 function syncPublishStatus(task) {
@@ -1792,39 +2428,239 @@ function syncPublishStatus(task) {
   return readiness;
 }
 
+function scheduleTimezoneOptions(active) {
+  const options = [
+    ["Asia/Shanghai", "中国时间 UTC+8"],
+    ["UTC", "UTC"],
+    ["America/Los_Angeles", "美国西岸 PT"],
+    ["America/Chicago", "美国中部 CT"],
+    ["America/New_York", "美国东岸 ET"],
+  ];
+  return options.map(([value, label]) => `<option value="${h(value)}" ${active === value ? "selected" : ""}>${h(label)}</option>`).join("");
+}
+
+function renderPublishScheduler(task, readiness) {
+  const mode = state.publishMode || "immediate";
+  return `
+    <div class="publish-scheduler panel">
+      <div class="panel-body">
+        <div class="schedule-controls">
+          <label>发布方式
+            <select data-field="publishMode" aria-label="发布方式">
+              <option value="immediate" ${mode === "immediate" ? "selected" : ""}>立即发布</option>
+              <option value="scheduled" ${mode === "scheduled" ? "selected" : ""}>定时发布</option>
+            </select>
+          </label>
+          <label>日期
+            <input type="date" data-field="scheduleDate" value="${h(state.scheduleDate || "")}" />
+          </label>
+          <label>时间
+            <input type="time" data-field="scheduleTime" value="${h(state.scheduleTime || "")}" />
+          </label>
+          <label>时区
+            <select data-field="scheduleTimezone">${scheduleTimezoneOptions(state.scheduleTimezone || "Asia/Shanghai")}</select>
+          </label>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderScheduledQueue() {
+  Core.markDueScheduledPosts(state);
+  const posts = Array.isArray(state.scheduledPosts) ? state.scheduledPosts : [];
+  if (!posts.length) return "";
+  return `
+    <div class="scheduled-queue panel">
+      <div class="panel-head">
+        <h2>定时发布队列</h2>
+        <span class="tag">${posts.length} 条</span>
+      </div>
+      <div class="panel-body">
+        <div class="scheduled-post-list">
+          ${posts.map((post) => renderScheduledPostRow(post)).join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderScheduledPostRow(post) {
+  const local = Core.scheduledIsoToLocal(post.scheduledAt, post.timezone || "Asia/Shanghai");
+  const hosted = post.status === "platform_scheduled";
+  const hasPlatformPost = Boolean(post.platformPostId);
+  const cancelPendingKey = `cancel-scheduled-post-${post.id}`;
+  const canPublish = !hosted && ["scheduled", "due", "failed"].includes(post.status);
+  const canEdit = ["scheduled", "due", "failed"].includes(post.status) || (hosted && hasPlatformPost);
+  const canCancel = post.status !== "cancelled" && post.status !== "published" && (!hosted || hasPlatformPost);
+  const cancelText = hasPlatformPost ? "取消平台定时" : "取消定时";
+  return `
+    <article class="scheduled-post-row ${post.status}">
+      <div class="scheduled-post-main">
+        <span class="status ${post.status === "published" ? "success" : post.status === "cancelled" ? "muted" : post.status === "failed" ? "danger" : "info"}">${h(Core.scheduledPostStatusLabel(post.status))}</span>
+        <strong>${h(post.copySnapshot?.title || post.taskTitle || "未命名文案")}</strong>
+        <span>${h(post.platformName || post.platformId)} · ${h(post.productName || "")}</span>
+        <em>${h(post.videoSnapshot?.url || "未记录视频地址")}</em>
+        ${hosted && post.platformPostId ? `<small>PostEverywhere ID：${h(post.platformPostId)}</small>` : ""}
+      </div>
+      <div class="scheduled-post-time">
+        <input type="date" data-scheduled-date="${h(post.id)}" value="${h(local.date)}" ${canEdit ? "" : "disabled"} />
+        <input type="time" data-scheduled-time="${h(post.id)}" value="${h(local.time)}" ${canEdit ? "" : "disabled"} />
+        <select data-scheduled-timezone="${h(post.id)}" ${canEdit ? "" : "disabled"}>${scheduleTimezoneOptions(post.timezone || "Asia/Shanghai")}</select>
+      </div>
+      <div class="scheduled-post-actions">
+        <button class="button subtle" data-action="reschedule-scheduled-post" data-scheduled-post-id="${h(post.id)}" ${canEdit ? "" : "disabled"}>更新时间</button>
+        <button class="button subtle" data-action="cancel-scheduled-post" data-scheduled-post-id="${h(post.id)}" ${pendingAttr(cancelPendingKey, !canCancel)}>${pendingLabel(cancelPendingKey, cancelText, "取消中")}</button>
+        <button class="button" data-action="publish-scheduled-now" data-scheduled-post-id="${h(post.id)}" ${canPublish ? "" : "disabled"}>立即发布</button>
+      </div>
+    </article>
+  `;
+}
+
+function publishMediaIds(task) {
+  return Core.publishMediaIds(state, task, state.selectedPlatforms);
+}
+
+function publisherFeedbackLine(task) {
+  const response = task.providerResponses && task.providerResponses.publisher;
+  if (!response) return "未提交";
+  const ok = response.ok !== false;
+  const upstream = response.upstream || {};
+  const status = upstream.status || response.status || "";
+  const error = response.error || upstream.error || upstream.data?.error?.message || "";
+  if (ok) return status ? `上次提交成功 HTTP ${status}` : "上次提交成功";
+  const issue = Core.explainProviderIssue(response, { kind: "publisher" });
+  return [status ? `上次提交失败 HTTP ${status}` : "上次提交失败", error, issue.title, issue.action].filter(Boolean).join(" · ");
+}
+
+function compactCopyText(copy, max = 110) {
+  const text = [copy?.title, copy?.hook, copy?.body].filter(Boolean).join(" / ").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function renderPublishQueueRow(task, platformId) {
+  const copy = sanitizedCopy(task.copies[platformId]);
+  const readiness = publishReadiness(task, [platformId]);
+  const platform = Core.platforms.find((item) => item.id === platformId);
+  const mediaIds = publishMediaIds(task);
+  const published = task.publishResults && task.publishResults[platformId];
+  const statusClassName = published ? "success" : readiness.ready ? "success" : readiness.missingPublisherMedia || readiness.pending.length ? "warning" : "muted";
+  const copyStatus = copy ? copy.approved ? "文案已通过" : "待文案审核" : "缺文案";
+  const mediaStatus = mediaIds.length ? `媒体 ${mediaIds[0]}` : "缺媒体";
+  let actions = "";
+  if (!copy) {
+    actions = `<button class="button compact" data-action="regenerate-copy" data-task-id="${h(task.id)}" data-platform="${platformId}">生成文案</button>`;
+  } else if (!copy.approved) {
+    actions = `<button class="button compact primary" data-action="approve-copy" data-task-id="${h(task.id)}" data-platform="${platformId}">通过</button>`;
+  } else if (readiness.missingPublisherMedia) {
+    actions = `<button class="button compact primary" data-action="upload-publisher-media" data-task-id="${h(task.id)}" data-platform="${platformId}" ${pendingAttr(`upload-publisher-media-${task.id}`)}>上传媒体</button>`;
+  } else if (published) {
+    actions = `<a href="${h(published.url || "#")}" target="_blank">发布链接</a>`;
+  } else {
+    actions = [
+      `<button class="button compact primary" data-action="open-publish-dialog" data-task-id="${h(task.id)}" data-platform="${platformId}">立即发布</button>`,
+      `<button class="button compact" data-action="open-schedule-dialog" data-task-id="${h(task.id)}" data-platform="${platformId}">定时发布</button>`,
+    ].join("");
+  }
+  return `
+    <article class="publish-queue-row" data-publish-row="${h(task.id)}" data-publish-task-card="${h(task.id)}">
+      <div class="publish-row-main">
+        <strong>${h(task.title || "未命名视频")}</strong>
+        <span>${h(task.productName || "")} · ${h(platform?.name || platformId)}</span>
+      </div>
+      <div class="publish-row-state">
+        <span class="status ${statusClassName}">${h(readiness.ready ? "可发布" : readiness.message)}</span>
+        <small>${h(copyStatus)} · ${h(mediaStatus)}</small>
+      </div>
+      <p class="publish-row-copy">${h(compactCopyText(copy) || "还没有平台文案。")}</p>
+      <div class="publish-row-feedback">${h(publisherFeedbackLine(task))}</div>
+      <div class="publish-row-actions">
+        <button class="button compact" data-action="open-copy-detail" data-task-id="${h(task.id)}" data-platform="${platformId}">查看文案</button>
+        <button class="button compact" data-action="regenerate-copy" data-task-id="${h(task.id)}" data-platform="${platformId}" ${pendingAttr(`regenerate-copy-${task.id}-${platformId}`)}>重新生成</button>
+        ${actions}
+      </div>
+    </article>
+  `;
+}
+
+function renderPublishActionModal() {
+  if (!publishDialog) return "";
+  const task = Core.getById(state.tasks, publishDialog.taskId);
+  const platformId = publishDialog.platformId || "tiktok";
+  if (!task || !task.copies || !task.copies[platformId]) return "";
+  const copy = sanitizedCopy(task.copies[platformId]);
+  const mode = publishDialog.mode || "immediate";
+  const mediaIds = publishMediaIds(task);
+  return `
+    <div class="modal-backdrop" role="presentation">
+      <section class="copy-detail-modal publish-action-modal" role="dialog" aria-modal="true" aria-label="${mode === "scheduled" ? "定时发布配置" : "发布确认"}">
+        <div class="modal-head">
+          <div>
+            <h2>${mode === "scheduled" ? "定时发布" : "立即发布"}</h2>
+            <p class="muted">${h(task.title || "未命名视频")} · TikTok</p>
+          </div>
+          <button class="button" data-action="close-publish-dialog">取消</button>
+        </div>
+        <div class="copy-detail-body compact-copy-detail">
+          <div class="publish-dialog-summary">
+            <div><span>账号</span><strong>${h(String(state.integrations.publisher.accountIds || "未配置"))}</strong></div>
+            <div><span>媒体</span><strong>${h(mediaIds.join(", ") || "未上传")}</strong></div>
+            <div><span>文案</span><strong>${copy.approved ? "已通过" : "待审核"}</strong></div>
+          </div>
+          ${mode === "scheduled" ? `
+            <div class="form-grid">
+              <div class="field"><label>日期</label><input type="date" data-dialog-field="scheduleDate" value="${h(state.scheduleDate || "")}" /></div>
+              <div class="field"><label>时间</label><input type="time" data-dialog-field="scheduleTime" value="${h(state.scheduleTime || "")}" /></div>
+              <div class="field"><label>时区</label><select data-dialog-field="scheduleTimezone">${scheduleTimezoneOptions(state.scheduleTimezone || "Asia/Shanghai")}</select></div>
+            </div>
+          ` : ""}
+          <div class="field">
+            <label>最终发布文案</label>
+            <textarea rows="8" readonly>${h(finalPlatformCopy(copy))}</textarea>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="button primary" data-action="${mode === "scheduled" ? "confirm-schedule-copy" : "confirm-publish-copy"}" data-task-id="${h(task.id)}" data-platform="${platformId}" ${pendingAttr(`${mode === "scheduled" ? "schedule-copy" : "publish-copy"}-${task.id}-${platformId}`)}>${mode === "scheduled" ? "确认定时" : "确认发布"}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderPublish() {
-  const task = selectedTask();
-  if (!task) return emptyState("还没有可发布任务", "先完成视频审核。", "create");
-  const platformIds = state.selectedPlatforms;
-  const readiness = publishReadiness(task, platformIds);
-  const cardPlatformIds = readiness.activeIds.length ? readiness.activeIds : platformIds;
+  const currentTask = selectedTask();
+  const readyTasks = state.tasks.filter((item) => item.status === "ready_to_publish");
+  const tasks = readyTasks.length ? readyTasks : (currentTask ? [currentTask] : []);
+  if (!tasks.length) return emptyState("还没有可发布任务", "先完成视频审核。", "create");
+  const summaryText = readyTasks.length
+    ? `${readyTasks.length} 条待发布任务`
+    : Core.taskStatusLabel(currentTask.status);
+  const readyCount = readyTasks.reduce((count, item) => count + (publishReadiness(item, state.selectedPlatforms).ready ? 1 : 0), 0);
+  const cardPlatformIds = (Core.publishPlatforms || Core.platforms).map((platform) => platform.id);
   return `
     <section class="stack">
       <div class="section-head">
-        <div><h1>文案与发布</h1><p class="muted">${h(task.title)} · ${Core.taskStatusLabel(task.status)}</p></div>
+        <div><h1>文案与发布</h1><p class="muted">${h(summaryText)}</p></div>
         <div class="actions">
           ${renderCopyStyleSelect()}
-          <button class="button" data-action="generate-copies" ${pendingAttr("generate-copies")}>${pendingLabel("generate-copies", "生成平台文案", "生成中")}</button>
-          <button class="button primary" data-action="publish-task" ${pendingAttr("publish-task")}>${pendingLabel("publish-task", "发布到 PostEverywhere", "发布中")}</button>
+          <button class="button subtle" data-action="generate-copies" ${pendingAttr("generate-copies")}>${pendingLabel("generate-copies", selectedCopyGenerationLabel(), "生成中")}</button>
         </div>
       </div>
-      <div class="publish-readiness ${readiness.ready || readiness.published ? "ready" : "blocked"}">
+      <div class="publish-readiness ${readyCount || !readyTasks.length ? "ready" : "blocked"}">
         <div class="publish-readiness-copy">
-          <strong>${readiness.published ? "发布反馈" : readiness.ready ? "可以发布" : "暂不能发布"}</strong>
-          <span>${h(readiness.message)}</span>
+          <strong>${readyTasks.length ? "待发布队列" : "发布反馈"}</strong>
+          <span>${readyTasks.length ? `当前共有 ${readyTasks.length} 条待发布任务，${readyCount} 条配置完整可提交。` : h(publishReadiness(currentTask, state.selectedPlatforms).message)}</span>
         </div>
         <div class="publish-management-actions">
-          <em>${readiness.approved}/${readiness.total} 平台文案已通过</em>
-          <button class="button subtle" data-action="approve-remaining-copies" ${readiness.pending.length ? "" : "disabled"}>批量通过剩余</button>
-          <button class="button subtle" data-action="clear-pending-copies" ${readiness.pending.length ? "" : "disabled"}>清空未通过</button>
+          <em>${readyTasks.length ? `${readyTasks.length} 条任务` : `${publishReadiness(currentTask, state.selectedPlatforms).approved}/${publishReadiness(currentTask, state.selectedPlatforms).total} 平台文案已通过`}</em>
         </div>
       </div>
-      ${renderPublisherFeedback(task)}
-      ${task.copySummary ? `<div class="panel"><div class="panel-body"><strong>文案摘要</strong><p class="muted">${h(task.copySummary)}</p></div></div>` : ""}
-      <div class="grid four">
-        ${cardPlatformIds.map(platformId => renderCopyCard(task, platformId)).join("")}
+      ${renderScheduledQueue()}
+      <div class="publish-queue-table">
+        ${tasks.map((task) => cardPlatformIds.map(platformId => renderPublishQueueRow(task, platformId)).join("")).join("")}
       </div>
-      ${renderCopyDetailModal(task)}
+      ${renderCopyDetailModal(currentTask)}
+      ${renderPublishActionModal()}
     </section>
   `;
 }
@@ -1833,42 +2669,26 @@ function renderSettings() {
   const llm = state.integrations.llm;
   const video = state.integrations.video;
   const publisher = state.integrations.publisher;
-  const task = selectedTask();
-  const preview = latestProviderPreview(task);
   return `
-    <section class="stack">
+    <section class="settings-screen stack">
       <div class="section-head">
-        <div><h1>集成设置</h1><p class="muted">大模型支持 DeepSeek、OpenAI 兼容接口和自定义接口；视频模型支持多 provider。静态页面不建议长期保存生产密钥。</p></div>
+        <div><h1>必要配置</h1><p class="muted">常用模型可以一键切换，接口参数仍可直接编辑。</p></div>
         <button class="button primary" data-view="create">返回生成任务</button>
       </div>
-      <div class="settings-block">
-        <div class="settings-block-head">
-          <div><h2>接口配置</h2><p class="muted">按调用链配置：内容生成、视频生成、发布分发。当前版本只走 http 真实接口，并由本地 server 代理。</p></div>
-          <span class="status ${isServerMode() ? "success" : "warning"}">${isServerMode() ? "server" : "file"}</span>
+      <div class="panel model-switch-console">
+        <div class="panel-head">
+          <div><h2>模型切换</h2></div>
+          <span class="tag">${h([llm.model, video.model].filter(Boolean).join(" / "))}</span>
         </div>
-        <div class="settings-config-grid">
-          <div class="stack compact-stack">
-            ${renderIntegrationProfilePanel("video", video)}
-            ${renderVideoIntegrationCard(video)}
-          </div>
-          <div class="stack compact-stack">
-            ${renderIntegrationProfilePanel("llm", llm)}
-            ${renderLlmIntegrationCard(llm)}
-          </div>
-        </div>
-        <div class="settings-config-grid publisher-row">
-          <div class="stack compact-stack">
-            ${renderIntegrationProfilePanel("publisher", publisher)}
-            ${renderPublisherIntegrationCard(publisher)}
-          </div>
-          ${renderPlatformSettingsCard()}
+        <div class="model-switch-grid">
+          ${renderIntegrationProfilePanel("llm", llm)}
+          ${renderIntegrationProfilePanel("video", video)}
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>当前请求/响应预览</h2><span class="tag">只显示最近一次</span></div>
-        <div class="panel-body">
-          <pre class="request-preview">${h(JSON.stringify(preview, null, 2))}</pre>
-        </div>
+      <div class="settings-config-grid minimal-settings-grid">
+        ${renderLlmIntegrationCard(llm)}
+        ${renderVideoIntegrationCard(video)}
+        ${renderPublisherIntegrationCard(publisher)}
       </div>
     </section>
   `;
@@ -1877,7 +2697,6 @@ function renderSettings() {
 function renderLlmIntegrationCard(value) {
   return renderIntegrationCard({
     title: "通用大模型",
-    description: "用于生成完整内容规划、分镜脚本和平台文案。",
     key: "llm",
     value,
     providerOptions: Core.llmProviders,
@@ -1892,35 +2711,36 @@ function providerName(providerId) {
 }
 
 const profileTitles = {
-  llm: ["模型配置", "保存常用大模型接口，下次一键启用。", "例如：DeepSeek、Bailian、OpenRouter Claude"],
-  video: ["视频模型配置", "保存常用视频生成接口，下次一键启用。", "例如：通义万相、Seedance、可灵"],
-  publisher: ["发布配置", "保存常用发布接口和账号配置，下次一键启用。", "例如：PostEverywhere 主账号"],
+  llm: ["大模型", "例如：DeepSeek、Bailian、OpenRouter Claude"],
+  video: ["视频模型", "例如：通义万相、Seedance、可灵"],
+  publisher: ["发布配置", "例如：PostEverywhere 主账号"],
 };
 
 function renderIntegrationProfilePanel(key, integration) {
   const profiles = state.integrationProfiles && Array.isArray(state.integrationProfiles[key]) ? state.integrationProfiles[key] : [];
   const activeId = state.activeIntegrationProfileIds && state.activeIntegrationProfileIds[key] || "";
-  const [title, description, placeholder] = profileTitles[key] || ["配置", "保存常用接口配置，下次一键启用。", "配置名称"];
+  const [title, placeholder] = profileTitles[key] || ["配置", "配置名称"];
   const suggestedName = (profiles.find((profile) => profile.id === activeId) || {}).name || integration.model || providerName(integration.provider || "") || "我的配置";
   const draftField = `${key}ProfileDraftName`;
   const justSaved = lastProfileSave && lastProfileSave.key === key;
   return `
-    <div class="panel model-switch-card">
-      <div class="panel-head">
-        <div><h2>${title}</h2><p class="muted">${description}</p></div>
+    <section class="model-switch-card">
+      <div class="model-switch-card-head">
+        <div>
+          <h3>${title}</h3>
+          <span>${h(integration.model || providerName(integration.provider || "") || "未选择")}</span>
+        </div>
         <span class="tag">${profiles.length} 个</span>
       </div>
-      <div class="panel-body stack">
-        ${justSaved ? `<div class="inline-success"><strong>已保存配置</strong><span>${h(lastProfileSave.name)} 已加入上方配置列表并设为使用中。</span></div>` : ""}
-        <div class="model-profile-save">
-          <input data-field="${draftField}" value="${h(state[draftField] || suggestedName)}" placeholder="${h(placeholder)}" />
-          <button class="button primary" data-action="save-integration-profile" data-profile-key="${key}">${justSaved ? "已保存" : activeId ? "保存为当前配置" : "保存配置"}</button>
-        </div>
-        <div class="model-profile-list">
-          ${profiles.length ? profiles.map((profile) => renderIntegrationProfileItem(key, profile)).join("") : `<div class="empty-profile">还没有配置。填好下方接口信息后，点击保存配置。</div>`}
-        </div>
+      ${justSaved ? `<div class="inline-success"><strong>已保存</strong><span>${h(lastProfileSave.name)}</span></div>` : ""}
+      <div class="model-profile-list">
+        ${profiles.length ? profiles.map((profile) => renderIntegrationProfileItem(key, profile)).join("") : `<div class="empty-profile">还没有配置。填好下方接口信息后，点击保存配置。</div>`}
       </div>
-    </div>
+      <div class="model-profile-save">
+        <input data-field="${draftField}" value="${h(state[draftField] || suggestedName)}" placeholder="${h(placeholder)}" />
+        <button class="button primary" data-action="save-integration-profile" data-profile-key="${key}">${justSaved ? "已保存" : activeId ? "保存当前" : "保存配置"}</button>
+      </div>
+    </section>
   `;
 }
 
@@ -1929,8 +2749,6 @@ function renderIntegrationProfileItem(key, profile) {
   const subtitle = profile.endpoint ? profile.endpoint.replace(/^https?:\/\//, "") : providerName(profile.provider);
   return `
     <div class="model-profile-item ${active ? "active" : ""}">
-      <div class="drag-dots" aria-hidden="true">⋮⋮</div>
-      <div class="model-avatar">${h((profile.name || "?").slice(0, 1).toUpperCase())}</div>
       <div class="model-profile-main">
         <strong>${h(profile.name)}</strong>
         <span>${h(subtitle)}</span>
@@ -1947,7 +2765,6 @@ function renderIntegrationProfileItem(key, profile) {
 function renderVideoIntegrationCard(value) {
   return renderIntegrationCard({
     title: "视频生成模型",
-    description: "用于提交图片转视频任务，并按任务 ID 查询生成结果。",
     key: "video",
     value,
     providerOptions: Core.videoProviders,
@@ -1965,23 +2782,18 @@ function renderVideoIntegrationCard(value) {
 function renderPublisherIntegrationCard(value) {
   return renderIntegrationCard({
     title: "PostEverywhere 发布",
-    description: "用于把审核通过的视频和多平台文案提交到发布系统。",
     key: "publisher",
     value,
     providerOptions: [{ id: "posteverywhere", name: "PostEverywhere" }, { id: "custom-publisher", name: "自定义发布接口" }],
     endpointLabel: "发布 Endpoint",
     extraFields: `
       <div class="field">
-        <label>工作区 ID</label>
-        <input data-field="integrations.publisher.workspaceId" value="${h(value.workspaceId || "")}" placeholder="例如：workspace_xxx，可为空" />
-      </div>
-      <div class="field">
         <label>PostEverywhere 账号 IDs</label>
         <input data-field="integrations.publisher.accountIds" value="${h(value.accountIds || "")}" placeholder="例如：2280,2282；来自 GET /accounts" />
       </div>
       <div class="field">
-        <label>Media IDs（可选）</label>
-        <input data-field="integrations.publisher.mediaIds" value="${h(value.mediaIds || "")}" placeholder="视频上传到 PostEverywhere 后返回的 media_ids" />
+        <label>PostEverywhere Media IDs</label>
+        <input data-field="integrations.publisher.mediaIds" value="${h(value.mediaIds || "")}" placeholder="例如：media_uuid；TikTok 必须绑定视频 media_id" />
       </div>
     `,
   });
@@ -1996,7 +2808,7 @@ function renderPlatformSettingsCard() {
       </div>
       <div class="panel-body stack">
         <div class="platform-options">
-          ${Core.platforms.map((platform) => `
+          ${(Core.publishPlatforms || Core.platforms).map((platform) => `
             <label class="platform-option">
               <input type="checkbox" data-platform-toggle="${platform.id}" ${state.selectedPlatforms.includes(platform.id) ? "checked" : ""} />
               <span>
@@ -2013,29 +2825,22 @@ function renderPlatformSettingsCard() {
 }
 
 function renderIntegrationCard(config) {
-  const { title, description, key, value, providerOptions, endpointLabel = "Endpoint", modelLabel = "模型", extraFields = "" } = config;
+  const { title, key, value, providerOptions, endpointLabel = "Endpoint", modelLabel = "模型", extraFields = "" } = config;
   const currentProvider = providerOptions.find((provider) => provider.id === value.provider);
   const testResult = state.connectionTests && state.connectionTests[key];
+  const testIssue = testResult && !testResult.ok ? Core.explainProviderIssue(testResult, { kind: key }) : null;
   return `
-    <div class="panel integration-card">
+    <div class="panel integration-card compact-integration-card">
       <div class="panel-head">
-        <div><h2>${title}</h2><p class="muted">${description}</p></div>
-        <span class="status info">http</span>
+        <h2>${title}</h2>
       </div>
       <div class="panel-body stack">
-        <div class="field">
-          <label>模式</label>
-          <select data-field="integrations.${key}.mode">
-            <option value="http" selected>http 真实接口</option>
-          </select>
-        </div>
         <div class="field">
           <label>Provider</label>
           <select data-field="integrations.${key}.provider" data-provider-group="${key}">
             ${providerOptions.map(provider => `<option value="${provider.id}" ${provider.id === value.provider ? "selected" : ""}>${h(provider.name || provider.id)}</option>`).join("")}
           </select>
         </div>
-        ${key === "llm" && value.apiStyle !== undefined ? `<div class="field"><label>接口格式</label><select data-field="integrations.${key}.apiStyle"><option value="openai-chat" ${value.apiStyle === "openai-chat" ? "selected" : ""}>OpenAI Chat Completions</option><option value="openai-responses" ${value.apiStyle === "openai-responses" ? "selected" : ""}>OpenAI Responses</option><option value="custom-json" ${value.apiStyle === "custom-json" ? "selected" : ""}>自定义 JSON</option></select></div>` : ""}
         <div class="field">
           <label>${endpointLabel}</label>
           <input data-field="integrations.${key}.endpoint" value="${h(value.endpoint || "")}" placeholder="https://..." />
@@ -2052,7 +2857,7 @@ function renderIntegrationCard(config) {
             <button class="button" data-action="test-connection" data-connection-key="${key}">测试连接</button>
             <button class="button danger" data-action="clear-api-key" data-connection-key="${key}">清空 Key</button>
           </div>
-          ${testResult ? `<div class="test-result ${testResult.ok ? "success" : "danger"}"><strong>${testResult.ok ? "连接正常" : "连接失败"}</strong><span>${h(testResult.message || testResult.error || "")}</span></div>` : `<p class="muted">测试前请先保存当前输入框变更。</p>`}
+          ${testResult ? `<div class="test-result ${testResult.ok ? "success" : "danger"}"><strong>${testResult.ok ? "连接正常" : "连接失败"}</strong><span>${h(testResult.ok ? (testResult.message || "") : providerIssueInline(testResult, { kind: key }))}</span>${testIssue && testIssue.rawMessage ? `<small>${h(testIssue.rawMessage)}</small>` : ""}</div>` : ""}
         </div>
       </div>
     </div>
@@ -2066,8 +2871,19 @@ function emptyState(title, description, targetView) {
 function bindEvents() {
   document.querySelectorAll("[data-view]").forEach((el) => {
     el.addEventListener("click", () => {
-      if (el.dataset.selectTask) state.selectedTaskId = el.dataset.selectTask;
-      if (el.dataset.useFavorite) state.selectedFavoriteId = el.dataset.useFavorite;
+      if (el.dataset.selectTask) {
+        state.selectedTaskId = el.dataset.selectTask;
+        if (el.dataset.view === "review") {
+          syncReviewFilterForTask(Core.getById(state.tasks, state.selectedTaskId));
+        }
+      }
+      if (el.dataset.useFavorite) {
+        state.selectedFavoriteId = el.dataset.useFavorite;
+        if (el.dataset.view === "reverse") {
+          state.reverseVideo = state.reverseVideo || Core.createInitialState().reverseVideo;
+          state.reverseVideo.selectedFavoriteId = el.dataset.useFavorite;
+        }
+      }
       storyboardEditorOpen = false;
       copyDetailPlatformId = "";
       view = el.dataset.view;
@@ -2100,22 +2916,53 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-dashboard-date-range]").forEach((el) => {
+    el.addEventListener("click", () => {
+      dashboardDateRange = el.dataset.dashboardDateRange || "today";
+      if (dashboardDateRange === "custom") {
+        const today = dateInputValue();
+        dashboardCustomStart = dashboardCustomStart || today;
+        dashboardCustomEnd = dashboardCustomEnd || today;
+      }
+      selectedTaskIds = new Set();
+      renderShell();
+    });
+  });
+
+  document.querySelectorAll("[data-dashboard-date-field]").forEach((el) => {
+    el.addEventListener("change", () => {
+      if (el.dataset.dashboardDateField === "start") dashboardCustomStart = el.value;
+      if (el.dataset.dashboardDateField === "end") dashboardCustomEnd = el.value;
+      dashboardDateRange = "custom";
+      selectedTaskIds = new Set();
+      renderShell();
+    });
+  });
+
+  document.querySelectorAll("[data-review-filter]").forEach((el) => {
+    el.addEventListener("click", () => {
+      reviewStatusFilter = el.dataset.reviewFilter || "all";
+      const nextTask = reviewTasksForFilter().find((item) => item.id === state.selectedTaskId) || reviewTasksForFilter()[0];
+      if (nextTask) state.selectedTaskId = nextTask.id;
+      saveState();
+      renderShell();
+    });
+  });
+
   document.querySelectorAll("[data-platform-toggle]").forEach((el) => {
     el.addEventListener("change", () => {
       const platformId = el.dataset.platformToggle;
-      const selected = new Set(state.selectedPlatforms);
-      if (el.checked) {
-        selected.add(platformId);
-      } else if (selected.size > 1) {
-        selected.delete(platformId);
-      } else {
-        el.checked = true;
-        toast("至少保留一个发布平台。");
-        return;
+      if (!setPlatformSelected(platformId, el.checked)) {
+        el.checked = state.selectedPlatforms.includes(platformId);
       }
-      state.selectedPlatforms = Core.platforms.map((platform) => platform.id).filter((id) => selected.has(id));
-      saveState();
-      renderShell();
+    });
+  });
+
+  document.querySelectorAll("[data-platform-card]").forEach((el) => {
+    el.addEventListener("click", (event) => {
+      if (event.target.closest("button,a,input,select,textarea,label")) return;
+      const platformId = el.dataset.platformCard;
+      setPlatformSelected(platformId, !state.selectedPlatforms.includes(platformId));
     });
   });
 
@@ -2255,6 +3102,20 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-favorites-search]").forEach((el) => {
+    el.addEventListener("input", () => {
+      favoritesSearch = el.value;
+      renderShell();
+    });
+  });
+
+  document.querySelectorAll("[data-favorites-type]").forEach((el) => {
+    el.addEventListener("change", () => {
+      favoritesType = el.value || "all";
+      renderShell();
+    });
+  });
+
   document.querySelectorAll("[data-field]").forEach((el) => {
     el.addEventListener("change", () => {
       const field = el.dataset.field;
@@ -2343,8 +3204,54 @@ function bindEvents() {
 }
 
 async function handleAction(dataset) {
-  const { action, platform: platformId, connectionKey, taskId, favoriteId, favoriteSource, profileId, profileKey, direction, productId } = dataset;
-  const task = selectedTask();
+  let { action, platform: platformId, connectionKey, taskId, favoriteId, favoriteSource, profileId, profileKey, direction, productId, scheduledPostId, targetView } = dataset;
+  const task = (taskId && Core.getById(state.tasks, taskId)) || selectedTask();
+  if (taskId && task) state.selectedTaskId = task.id;
+  if (action === "select-favorite") {
+    const favorite = Core.getById(state.favorites, favoriteId);
+    if (!favorite) {
+      toast("收藏不存在或已被删除。");
+      return;
+    }
+    state.selectedFavoriteId = favorite.id;
+    saveState();
+    renderShell();
+    return;
+  }
+  if (action === "use-favorite-for-create") {
+    const favorite = Core.getById(state.favorites, favoriteId || state.selectedFavoriteId);
+    if (!favorite) {
+      toast("请先选择一个收藏。");
+      return;
+    }
+    state.selectedFavoriteId = favorite.id;
+    state.contentBrief = state.contentBrief || {};
+    state.contentBrief.seed = favoriteReferenceText(favorite);
+    view = targetView || "create";
+    storyboardEditorOpen = false;
+    copyDetailPlatformId = "";
+    saveState();
+    renderShell();
+    toast("已把收藏带入新建内容规划。");
+    return;
+  }
+  if (action === "use-favorite-for-reverse") {
+    const favorite = Core.getById(state.favorites, favoriteId || state.selectedFavoriteId);
+    if (!favorite) {
+      toast("请先选择一个收藏。");
+      return;
+    }
+    state.selectedFavoriteId = favorite.id;
+    state.reverseVideo = state.reverseVideo || Core.createInitialState().reverseVideo;
+    state.reverseVideo.selectedFavoriteId = favorite.id;
+    view = "reverse";
+    storyboardEditorOpen = false;
+    copyDetailPlatformId = "";
+    saveState();
+    renderShell();
+    toast("已把收藏设为反推二创脚本。");
+    return;
+  }
   if (action === "save-state") {
     saveState();
     toast("当前数据已保存到本地浏览器。");
@@ -2584,6 +3491,23 @@ async function handleAction(dataset) {
     toast("任务已删除。");
     return;
   }
+  if (action === "delete-current-task") {
+    if (!task) {
+      toast("任务不存在或已被删除。");
+      return;
+    }
+    if (!window.confirm(`确认删除任务「${task.title}」？删除后将从本地任务列表移除。`)) return;
+    const deletedId = task.id;
+    Core.deleteTask(state, deletedId);
+    selectedTaskIds.delete(deletedId);
+    copyDetailPlatformId = "";
+    const nextReviewTask = reviewQueueTasks()[0] || null;
+    state.selectedTaskId = nextReviewTask ? nextReviewTask.id : null;
+    saveState();
+    renderShell();
+    toast("任务已删除。");
+    return;
+  }
   if (action === "batch-delete-tasks") {
     const targets = selectedTasks();
     if (!targets.length) {
@@ -2660,10 +3584,16 @@ async function handleAction(dataset) {
     }
     const batchCount = Math.max(1, Math.min(Number(state.contentBrief?.videoBatchCount || 1), 10));
     const creationStrategy = state.contentBrief?.videoCreationStrategy || "original";
+    const videoResolution = ["480p", "720p", "1080p"].includes(String(state.contentBrief?.videoResolution || "").toLowerCase())
+      ? String(state.contentBrief.videoResolution).toLowerCase()
+      : "720p";
+    planTask.videoResolution = videoResolution;
+    planTask.contentBrief = Object.assign({}, planTask.contentBrief || {}, { videoResolution });
     if (batchCount > 1 || creationStrategy !== "original") {
       const tasks = Core.createTasksFromContentPlanStoryboard(state, planTask, {
         count: batchCount,
         strategy: creationStrategy,
+        videoResolution,
       });
       selectedTaskIds = new Set(tasks.map((item) => item.id));
       state.selectedTaskId = tasks[0] && tasks[0].id || planTask.id;
@@ -2776,6 +3706,17 @@ async function handleAction(dataset) {
     toast(message);
     return;
   }
+  if (action === "refresh-review-status") {
+    const before = task.status;
+    if (["copy_review", "ready_to_publish", "published"].includes(task.status)) {
+      syncPublishStatus(task);
+      task.updatedAt = new Date().toISOString();
+    }
+    saveState();
+    renderShell();
+    toast(before === task.status ? "审核状态已刷新。" : `审核状态已更新为：${Core.taskStatusLabel(task.status)}`);
+    return;
+  }
   if (action === "download-video") {
     if (!startPending(action)) return;
     try {
@@ -2799,10 +3740,38 @@ async function handleAction(dataset) {
     return;
   }
   if (action === "generate-copies") {
+    const hasExistingSelectedCopy = state.selectedPlatforms.some((id) => task.copies && task.copies[id]);
+    if (hasExistingSelectedCopy && !window.confirm(`这会重新生成所选平台文案，并覆盖已有内容。继续？`)) return;
     if (!startPending(action)) return;
     await generateCopiesForTask(task);
     finishPending(action);
     toast("平台文案已生成。");
+    return;
+  }
+  if (action === "recover-missing-copies") {
+    const missingPlatformIds = missingSelectedCopyPlatformIds(task);
+    if (!missingPlatformIds.length) {
+      toast("当前任务没有缺失的平台文案。");
+      return;
+    }
+    if (!startPending(action)) return;
+    for (const missingPlatformId of missingPlatformIds) {
+      await generateCopyForPlatform(task, missingPlatformId);
+    }
+    finishPending(action);
+    toast("缺失的平台文案已重新生成。");
+    return;
+  }
+  if (action === "regenerate-copy") {
+    if (!platformId) {
+      toast("没有找到要重新生成的平台。");
+      return;
+    }
+    const pendingKey = taskId ? `regenerate-copy-${task.id}-${platformId}` : `regenerate-copy-${platformId}`;
+    if (!startPending(pendingKey)) return;
+    await generateCopyForPlatform(task, platformId);
+    finishPending(pendingKey);
+    toast("这条平台文案已重新生成。");
     return;
   }
   if (action === "approve-copy") {
@@ -2827,6 +3796,181 @@ async function handleAction(dataset) {
     saveState();
     renderShell();
     toast("平台文案已移除，可重新生成。");
+    return;
+  }
+  if (action === "open-publish-dialog" || action === "open-schedule-dialog") {
+    const readiness = publishReadiness(task, [platformId]);
+    if (!readiness.ready) {
+      toast(`还不能发布：${readiness.message}`);
+      return;
+    }
+    publishDialog = {
+      mode: action === "open-schedule-dialog" ? "scheduled" : "immediate",
+      taskId: task.id,
+      platformId,
+    };
+    renderShell();
+    return;
+  }
+  if (action === "close-publish-dialog") {
+    publishDialog = null;
+    renderShell();
+    return;
+  }
+  if (action === "upload-publisher-media") {
+    const pendingKey = `upload-publisher-media-${task.id}`;
+    if (!startPending(pendingKey)) return;
+    try {
+      const result = await uploadTaskMediaToPublisher(task);
+      task.video = task.video || {};
+      task.video.posteverywhereMediaId = result.mediaId;
+      task.video.posteverywhereMedia = result;
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.publisherMedia = result;
+      task.updatedAt = new Date().toISOString();
+      syncPublishStatus(task);
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast(`PostEverywhere 媒体已上传：${result.mediaId}`);
+    } catch (error) {
+      finishPending(pendingKey);
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.publisherMedia = { ok: false, error: error.message };
+      saveState();
+      renderShell();
+      toast(`媒体上传失败：${error.message}`);
+    }
+    return;
+  }
+  if (action === "confirm-schedule-copy") {
+    const dateInput = document.querySelector('[data-dialog-field="scheduleDate"]');
+    const timeInput = document.querySelector('[data-dialog-field="scheduleTime"]');
+    const timezoneInput = document.querySelector('[data-dialog-field="scheduleTimezone"]');
+    const dateValue = dateInput && dateInput.value;
+    const timeValue = timeInput && timeInput.value;
+    if (!dateValue || !timeValue) {
+      toast("请先选择日期和时间。");
+      return;
+    }
+    const pendingKey = `schedule-copy-${task.id}-${platformId}`;
+    if (!startPending(pendingKey)) return;
+    let scheduledPost = null;
+    try {
+      state.scheduleDate = dateValue;
+      state.scheduleTime = timeValue;
+      state.scheduleTimezone = timezoneInput?.value || "Asia/Shanghai";
+      scheduledPost = Core.createScheduledPost(state, task, platformId, {
+        scheduledAt: `${dateValue}T${timeValue}`,
+        timezone: state.scheduleTimezone,
+      });
+      const response = await callProvider("publisher", scheduledPost.providerRequestPreview);
+      Core.applyScheduledPostProviderResult(scheduledPost, response);
+      publishDialog = null;
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast("已提交到 PostEverywhere 托管定时。");
+    } catch (error) {
+      if (scheduledPost) {
+        scheduledPost.status = "failed";
+        scheduledPost.providerResponse = { ok: false, error: error.message };
+        scheduledPost.updatedAt = new Date().toISOString();
+      }
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast(`托管定时失败：${error.message}`);
+    }
+    return;
+  }
+  if (action === "confirm-publish-copy") {
+    publishDialog = null;
+    action = "publish-copy";
+  }
+  if (action === "publish-copy") {
+    const readiness = publishReadiness(task, [platformId]);
+    if (!readiness.ready) {
+      toast(`还不能发布：${readiness.message}`);
+      return;
+    }
+    const pendingKey = taskId ? `publish-copy-${task.id}-${platformId}` : `publish-copy-${platformId}`;
+    if (!startPending(pendingKey)) return;
+    const copy = task.copies[platformId];
+    const previewTask = Object.assign({}, task, {
+      copies: { [platformId]: copy },
+      providerRequests: Object.assign({}, task.providerRequests || {}),
+    });
+    previewTask.providerRequests.publisher = Core.buildPublishProviderRequest(state, previewTask);
+    let published = true;
+    try {
+      task.providerRequests = task.providerRequests || {};
+      task.providerRequests.publisher = previewTask.providerRequests.publisher;
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.publisher = await callProvider("publisher", previewTask.providerRequests.publisher);
+      const applied = Core.applyPublishProviderResult(previewTask, task.providerResponses.publisher);
+      if (applied) {
+        task.publishResults = Object.assign({}, task.publishResults || {}, previewTask.publishResults || {});
+      } else {
+        task.publishResults = task.publishResults || {};
+        task.publishResults[platformId] = {
+          platformName: copy.platformName || platformId,
+          status: "published",
+          url: `https://posteverywhere.example/${platformId}/${task.id}`,
+          publishedAt: new Date().toISOString(),
+        };
+      }
+      if (Object.keys(task.publishResults || {}).length >= Object.keys(task.copies || {}).filter((id) => task.copies[id]?.approved).length) {
+        task.status = "published";
+      }
+    } catch (error) {
+      published = false;
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.publisher = { ok: false, error: error.message };
+      toast(`发布失败：${error.message}`);
+    }
+    task.updatedAt = new Date().toISOString();
+    finishPending(pendingKey);
+    saveState();
+    renderShell();
+    if (published) toast("已提交这条文案。");
+    return;
+  }
+  if (action === "schedule-copy") {
+    const readiness = publishReadiness(task, [platformId]);
+    if (!readiness.ready) {
+      toast(`还不能定时：${readiness.message}`);
+      return;
+    }
+    if (!state.scheduleDate || !state.scheduleTime) {
+      toast("请先选择日期和时间。");
+      return;
+    }
+    const pendingKey = taskId ? `schedule-copy-${task.id}-${platformId}` : `schedule-copy-${platformId}`;
+    if (!startPending(pendingKey)) return;
+    let scheduledPost = null;
+    try {
+      scheduledPost = Core.createScheduledPost(state, task, platformId, {
+        scheduledAt: `${state.scheduleDate}T${state.scheduleTime}`,
+        timezone: state.scheduleTimezone || "Asia/Shanghai",
+      });
+      const response = await callProvider("publisher", scheduledPost.providerRequestPreview);
+      Core.applyScheduledPostProviderResult(scheduledPost, response);
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast("已提交到 PostEverywhere 托管定时。");
+    } catch (error) {
+      if (scheduledPost) {
+        scheduledPost.status = "failed";
+        scheduledPost.providerResponse = { ok: false, error: error.message };
+        scheduledPost.updatedAt = new Date().toISOString();
+      }
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast(`托管定时失败：${error.message}`);
+    }
     return;
   }
   if (action === "approve-remaining-copies") {
@@ -2882,6 +4026,149 @@ async function handleAction(dataset) {
     }
     finishPending(action);
     if (published) toast(state.integrations.publisher.mode === "http" ? "已提交到 PostEverywhere。" : "已模拟发布到 PostEverywhere。");
+  }
+  if (action === "schedule-publish") {
+    const readiness = publishReadiness(task, state.selectedPlatforms);
+    if (!readiness.ready) {
+      toast(`还不能定时发布：${readiness.message}`);
+      return;
+    }
+    if (!state.scheduleDate || !state.scheduleTime) {
+      toast("请先选择定时发布的日期和时间。");
+      return;
+    }
+    if (!startPending(action)) return;
+    let scheduledPost = null;
+    try {
+      const platform = readiness.approvedIds[0] || state.selectedPlatforms[0];
+      scheduledPost = Core.createScheduledPost(state, task, platform, {
+        scheduledAt: `${state.scheduleDate}T${state.scheduleTime}`,
+        timezone: state.scheduleTimezone || "Asia/Shanghai",
+      });
+      const response = await callProvider("publisher", scheduledPost.providerRequestPreview);
+      Core.applyScheduledPostProviderResult(scheduledPost, response);
+      finishPending(action);
+      saveState();
+      renderShell();
+      toast("已提交到 PostEverywhere 托管定时。");
+    } catch (error) {
+      if (scheduledPost) {
+        scheduledPost.status = "failed";
+        scheduledPost.providerResponse = { ok: false, error: error.message };
+        scheduledPost.updatedAt = new Date().toISOString();
+      }
+      finishPending(action);
+      saveState();
+      renderShell();
+      toast(`托管定时失败：${error.message}`);
+    }
+    return;
+  }
+  if (action === "cancel-scheduled-post") {
+    const post = (state.scheduledPosts || []).find((item) => item.id === scheduledPostId);
+    if (!post) {
+      toast("没有找到这条定时任务。");
+      return;
+    }
+    if (post.platformPostId) {
+      const pendingKey = `cancel-scheduled-post-${scheduledPostId}`;
+      if (!startPending(pendingKey)) return;
+      try {
+        const cancelRequest = Core.buildCancelScheduledPostProviderRequest(state, post);
+        const response = await callProvider("publisher", cancelRequest);
+        Core.applyCancelScheduledPostProviderResult(post, response);
+        finishPending(pendingKey);
+        saveState();
+        renderShell();
+        toast("已取消 PostEverywhere 平台定时。");
+      } catch (error) {
+        post.providerCancelResponse = { ok: false, error: error.message };
+        post.updatedAt = new Date().toISOString();
+        finishPending(pendingKey);
+        saveState();
+        renderShell();
+        toast(`平台定时取消失败：${error.message}`);
+      }
+      return;
+    }
+    Core.cancelScheduledPost(state, scheduledPostId);
+    saveState();
+    renderShell();
+    toast("已取消定时发布。");
+    return;
+  }
+  if (action === "reschedule-scheduled-post") {
+    const dateInput = document.querySelector(`[data-scheduled-date="${scheduledPostId}"]`);
+    const timeInput = document.querySelector(`[data-scheduled-time="${scheduledPostId}"]`);
+    const timezoneInput = document.querySelector(`[data-scheduled-timezone="${scheduledPostId}"]`);
+    const dateValue = dateInput && dateInput.value;
+    const timeValue = timeInput && timeInput.value;
+    if (!dateValue || !timeValue) {
+      toast("请先填写新的定时日期和时间。");
+      return;
+    }
+    const pendingKey = `reschedule-scheduled-post-${scheduledPostId}`;
+    if (!startPending(pendingKey)) return;
+    try {
+      const post = Core.reschedulePost(state, scheduledPostId, `${dateValue}T${timeValue}`, timezoneInput?.value || "Asia/Shanghai");
+      if (!post) {
+        finishPending(pendingKey);
+        toast("没有找到这条定时任务。");
+        return;
+      }
+      if (post.platformPostId) {
+        const rescheduleRequest = Core.buildRescheduleScheduledPostProviderRequest(state, post);
+        const response = await callProvider("publisher", rescheduleRequest);
+        Core.applyRescheduleScheduledPostProviderResult(post, response);
+      } else {
+        const response = await callProvider("publisher", post.providerRequestPreview);
+        Core.applyScheduledPostProviderResult(post, response);
+      }
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast(post.platformPostId ? "已更新 PostEverywhere 平台定时时间。" : "已更新并提交到 PostEverywhere 托管定时。");
+    } catch (error) {
+      const post = (state.scheduledPosts || []).find((item) => item.id === scheduledPostId);
+      if (post) {
+        post.status = "failed";
+        post.providerResponse = { ok: false, error: error.message };
+        post.updatedAt = new Date().toISOString();
+      }
+      finishPending(pendingKey);
+      saveState();
+      renderShell();
+      toast(`托管更新时间失败：${error.message}`);
+    }
+    return;
+  }
+  if (action === "publish-scheduled-now") {
+    const post = (state.scheduledPosts || []).find((item) => item.id === scheduledPostId);
+    if (!post) {
+      toast("没有找到这条定时任务。");
+      return;
+    }
+    if (!startPending(`publish-scheduled-now-${scheduledPostId}`)) return;
+    post.status = "publishing";
+    post.updatedAt = new Date().toISOString();
+    let published = true;
+    try {
+      const response = await callProvider("publisher", post.providerRequestPreview);
+      post.providerResponse = response;
+      post.status = response && response.ok === false ? "failed" : "published";
+      post.publishedAt = post.status === "published" ? new Date().toISOString() : "";
+      if (post.status === "failed") published = false;
+    } catch (error) {
+      published = false;
+      post.status = "failed";
+      post.providerResponse = { ok: false, error: error.message };
+      toast(`定时任务发布失败：${error.message}`);
+    }
+    finishPending(`publish-scheduled-now-${scheduledPostId}`);
+    saveState();
+    renderShell();
+    if (published) toast("定时任务已提交到 PostEverywhere。");
+    return;
   }
 }
 
@@ -2967,6 +4254,44 @@ async function generateCopiesForTask(task) {
     task.providerResponses.copy = { ok: false, error: error.message };
     Core.generateCopies(task, state.selectedPlatforms, { style: state.copyStyle });
   }
+}
+
+async function generateCopyForPlatform(task, platformId) {
+  task.providerRequests = task.providerRequests || {};
+  task.providerResponses = task.providerResponses || {};
+  task.copyStyle = state.copyStyle || "ugc-real";
+  const request = Core.buildCopyProviderRequest(state, task, [platformId]);
+  task.providerRequests.copy = request;
+  task.providerRequests.copyByPlatform = Object.assign({}, task.providerRequests.copyByPlatform || {}, {
+    [platformId]: request,
+  });
+  try {
+    const response = await callProvider("copy", request);
+    task.providerResponses.copy = response;
+    task.providerResponses.copyByPlatform = Object.assign({}, task.providerResponses.copyByPlatform || {}, {
+      [platformId]: response,
+    });
+    const draftTask = Object.assign({}, task, { copies: {} });
+    const applied = Core.applyCopyProviderResult(draftTask, response);
+    if (applied && draftTask.copies[platformId]) {
+      task.copies[platformId] = draftTask.copies[platformId];
+      task.copySummary = draftTask.copySummary || task.copySummary;
+    } else {
+      Core.generateCopies(task, [platformId], { style: state.copyStyle });
+      task.providerResponses.copyFallbackByPlatform = Object.assign({}, task.providerResponses.copyFallbackByPlatform || {}, {
+        [platformId]: "provider returned no usable copy for this platform",
+      });
+    }
+  } catch (error) {
+    task.providerResponses.copy = { ok: false, error: error.message };
+    task.providerResponses.copyByPlatform = Object.assign({}, task.providerResponses.copyByPlatform || {}, {
+      [platformId]: task.providerResponses.copy,
+    });
+    Core.generateCopies(task, [platformId], { style: state.copyStyle });
+  }
+  if (task.publishResults) delete task.publishResults[platformId];
+  task.status = "copy_review";
+  syncPublishStatus(task);
 }
 
 function updateContentPlanStream(patch) {

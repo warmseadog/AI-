@@ -16,6 +16,10 @@ function assertNoDemoWaterText(value, label) {
   });
 }
 
+function assertNoChineseText(value, label) {
+  assert.ok(!/[\u3400-\u9fff]/.test(String(value || "")), `${label} should not include Chinese text`);
+}
+
 function userMessagePayload(request) {
   const message = request.body.messages.find((item) => item.role === "user");
   if (Array.isArray(message.content)) {
@@ -51,8 +55,10 @@ assert.strictEqual(state.contentBrief.seed, "", "default idea input starts empty
 assert.strictEqual(state.contentBrief.text, "", "default generated plan text starts empty");
 assert.strictEqual(state.contentBrief.storyboardSceneCount, "auto", "default storyboard scene count is automatic");
 assert.strictEqual(state.contentBrief.storyboardDetailLevel, "detailed", "default storyboard detail level asks for detailed scenes");
+assert.strictEqual(state.contentBrief.videoResolution, "720p", "default video resolution is 720p");
 assert.deepStrictEqual(state.favorites, [], "default state has no seeded favorites");
 assert.deepStrictEqual(state.tasks, [], "default state has no seeded tasks");
+assert.deepStrictEqual(state.scheduledPosts, [], "default state has no scheduled publishing queue");
 assert.strictEqual(state.integrations.llm.mode, "http", "LLM defaults to real HTTP mode");
 assert.strictEqual(state.integrations.llm.provider, "custom-llm", "LLM defaults to the custom GPT-5.5 provider");
 assert.strictEqual(state.integrations.llm.model, "gpt-5.5", "LLM defaults to GPT-5.5");
@@ -60,7 +66,58 @@ assert.strictEqual(state.integrations.llm.endpoint, "https://toapis.com/v1/chat/
 assert.strictEqual(state.integrations.video.mode, "http", "video defaults to real HTTP mode");
 assert.strictEqual(state.integrations.publisher.mode, "http", "publisher defaults to real HTTP mode");
 assert.deepStrictEqual(state.selectedPlatforms, ["tiktok"], "default publishing platform is TikTok only");
+assert.deepStrictEqual(Core.publishPlatforms.map((platform) => platform.id), ["tiktok"], "enabled publishing platforms are limited to TikTok");
 assertNoDemoWaterText(state, "initial state");
+
+const quotaIssue = Core.explainProviderIssue({
+  ok: false,
+  upstream: { status: 403, data: { code: "quota_not_enough", message: "user quota is not enough" } },
+});
+assert.strictEqual(quotaIssue.title, "余额不足", "quota errors get an operator-readable title");
+assert.ok(quotaIssue.action.includes("充值") || quotaIssue.action.includes("切换"), "quota errors explain the next operator action");
+
+const timeoutIssue = Core.explainProviderIssue({
+  ok: false,
+  error: "<!DOCTYPE html><title>toapis.com | 524: A timeout occurred</title>",
+});
+assert.strictEqual(timeoutIssue.title, "接口超时", "Cloudflare timeout errors get an operator-readable title");
+assert.ok(timeoutIssue.action.includes("稍后重试"), "timeout errors tell the operator to retry later");
+
+const emptyModelIssue = Core.explainProviderIssue({
+  ok: false,
+  error: "上游没有返回内容：收到空的流式响应，没有 message.content 或 output_text。",
+});
+assert.strictEqual(emptyModelIssue.title, "模型无返回", "empty model responses get an operator-readable title");
+assert.ok(emptyModelIssue.action.includes("重新生成"), "empty responses tell the operator to regenerate");
+
+const stillGeneratingIssue = Core.explainProviderIssue({
+  output: { task_status: "PENDING", task_id: "task-123" },
+}, { kind: "video", status: "video_generating" });
+assert.strictEqual(stillGeneratingIssue.title, "视频仍在生成", "pending video status gets an operator-readable title");
+assert.ok(stillGeneratingIssue.action.includes("查询视频结果"), "pending video status explains the next poll action");
+
+const publisherAccountIssue = Core.explainProviderIssue("缺少 PostEverywhere 账号 ID。", { kind: "publisher" });
+assert.strictEqual(publisherAccountIssue.title, "发布账号没配置", "missing publisher account gets an operator-readable title");
+assert.ok(publisherAccountIssue.action.includes("集成设置"), "missing publisher account points to settings");
+
+const mp4Issue = Core.explainProviderIssue({
+  ok: false,
+  error: "PostEverywhere TikTok 视频上传当前只支持 MP4，请先转成 video/mp4。当前类型：video/quicktime",
+});
+assert.strictEqual(mp4Issue.title, "视频格式不是 MP4", "unsupported video format gets an operator-readable title");
+assert.ok(mp4Issue.action.includes("MP4"), "unsupported video format tells the operator to convert to MP4");
+
+const migratedPlatformState = Core.migrateState({
+  schemaVersion: 2,
+  selectedPlatforms: ["instagram", "youtube", "threads"],
+});
+assert.deepStrictEqual(migratedPlatformState.selectedPlatforms, ["tiktok"], "migration does not keep unsupported publishing platforms enabled");
+
+const migratedMixedPlatformState = Core.migrateState({
+  schemaVersion: 2,
+  selectedPlatforms: ["tiktok", "instagram"],
+});
+assert.deepStrictEqual(migratedMixedPlatformState.selectedPlatforms, ["tiktok"], "migration keeps only TikTok when saved state includes extra platforms");
 
 const oldState = Core.migrateState({
   products: [{ id: "old", imageUrl: "https://demo.test/old.png", imageLabel: ["净", "饮", "机"].join("") }],
@@ -98,6 +155,10 @@ const planPayload = userMessagePayload(planRequest);
 assert.strictEqual(planPayload.idea, state.contentBrief.seed, "content plan request includes user idea");
 assert.strictEqual(planPayload.materials.length, 1, "content plan request includes image material");
 assert.strictEqual(planPayload.materials[0].url, "https://example.test/neck-fan.png", "content plan request includes product image URL");
+assert.strictEqual(planPayload.outputLanguage.language, "zh-CN", "content plan request requires readable Chinese output");
+assert.ok(JSON.stringify(planRequest.body).includes("所有面向运营审核的可读字段必须使用简体中文"), "content plan system prompt requires Chinese readable fields");
+assert.ok(JSON.stringify(planRequest.body).includes("至少 80%"), "content plan request enforces mostly Chinese output");
+assert.ok(JSON.stringify(planRequest.body).includes("不允许整段英文输出"), "content plan request rejects English-only sections");
 assert.strictEqual(planPayload.duration, 15, "content plan request asks for 15 second plan");
 assert.strictEqual(planPayload.ratio, "9:16", "content plan request asks for vertical video");
 assert.ok(!planPayload.outputFields.includes("scenes"), "content plan request does not ask for scenes");
@@ -148,6 +209,22 @@ assert.strictEqual(created.storyboardTimingStatus, "not_started", "content plan 
 assert.strictEqual(state.tasks[0].id, created.id, "created content plan task is persisted");
 assertNoDemoWaterText(created, "created content plan task");
 
+const objectListState = Core.createInitialState();
+const objectListTask = Core.createContentPlanTask(objectListState, {
+  contentPlan: {
+    productUnderstanding: "挂脖风扇",
+    targetAudience: "TikTok 美国用户",
+    keySellingPoints: [{ point: "Hands-free", expression: "不需要手持风扇" }],
+    usageScenarios: ["commute"],
+    painPoints: [{ problem: "夏天排队太热", scene: "户外咖啡店门口" }],
+    strategy: "娱乐化夏日反差短剧",
+    hook: "POV: You stepped outside in July",
+  },
+});
+assert.ok(!objectListTask.contentPlan.keySellingPoints.includes("[object Object]"), "object-shaped plan list items are not stringified as [object Object]");
+assert.ok(objectListTask.contentPlan.keySellingPoints[0].includes("Hands-free"), "object-shaped selling points keep readable object content");
+assert.ok(objectListTask.contentPlan.painPoints[0].includes("夏天排队太热"), "object-shaped pain points keep readable object content");
+
 created.contentPlan.strategy = "用户手动改过的内容规划：先讲办公室热浪，再展示挂脖风扇。";
 created.contentPlan.storyboardGuidance = "每个镜头都必须围绕办公室通勤和产品佩戴展开。";
 created.contentPlanText = "# 用户修改后的中文大框\n办公室热浪开场，先展示真实痛点，再展示挂脖风扇。";
@@ -160,6 +237,10 @@ assert.strictEqual(storyboardFromPlanPayload.contentPlan.storyboardGuidance, cre
 assert.strictEqual(storyboardFromPlanPayload.contentPlanText, created.contentPlanText, "storyboard request includes the single edited Chinese content plan box");
 assert.strictEqual(storyboardFromPlanPayload.sceneCount, 8, "auto scene count defaults to 8 scenes for a 15 second content plan");
 assert.strictEqual(storyboardFromPlanPayload.detailLevel, "dense", "storyboard request includes selected detail level");
+assert.strictEqual(storyboardFromPlanPayload.outputLanguage.language, "zh-CN", "storyboard request requires readable Chinese output");
+assert.ok(JSON.stringify(storyboardFromPlanRequest.body).includes("所有面向运营审核的可读字段必须使用简体中文"), "storyboard system prompt requires Chinese readable fields");
+assert.ok(JSON.stringify(storyboardFromPlanRequest.body).includes("至少 80%"), "storyboard request enforces mostly Chinese output");
+assert.ok(JSON.stringify(storyboardFromPlanRequest.body).includes("只有 subtitle、screenText、voiceover"), "storyboard request limits English to audience-facing short text");
 
 state.contentBrief.storyboardSceneCount = "10";
 state.contentBrief.storyboardDetailLevel = "dense";
@@ -563,6 +644,19 @@ assert.ok(userVisionParts(gptVisionRequest).some((part) => part.type === "image_
 assert.strictEqual(userVisionParts(gptVisionRequest).filter((part) => part.type === "image_url").length, 4, "gpt reverse request limits inline images to representative frames");
 assert.strictEqual(userMessagePayload(gptVisionRequest).frames.length, 8, "gpt reverse request keeps all frame metadata even when inline image count is capped");
 
+const responsesVisionState = Core.migrateState(JSON.parse(JSON.stringify(state)));
+responsesVisionState.integrations.llm.apiStyle = "openai-responses";
+responsesVisionState.integrations.llm.endpoint = "https://api.openai.com/v1/responses";
+responsesVisionState.integrations.llm.model = "gpt-5.5";
+responsesVisionState.reverseVideo.frames = [
+  { time: "0.0s", url: "/outputs/uploads/upload_verify/frames/frame-001.jpg", label: "frame-001", dataUrl: "data:image/jpeg;base64,CCC" },
+];
+const responsesVisionRequest = Core.buildReverseStoryboardProviderRequest(responsesVisionState);
+const responsesUserContent = responsesVisionRequest.body.input.find((item) => item.role === "user").content;
+assert.ok(Array.isArray(responsesUserContent), "Responses reverse request uses content parts for multimodal input");
+assert.ok(responsesUserContent.some((part) => part.type === "input_image"), "Responses reverse request includes input_image frame parts");
+assert.ok(responsesUserContent.some((part) => part.type === "input_text" && !part.text.includes("base64")), "Responses reverse request keeps base64 out of JSON text metadata");
+
 const reverseTaskCountBefore = state.tasks.length;
 const reverseResult = Core.applyReverseStoryboardProviderResult(state, reverseRequest, {
   ok: true,
@@ -604,6 +698,33 @@ assert.strictEqual(reverseResult.sourceReconstruction.productIdentity, "原视�
 assert.deepStrictEqual(reverseResult.rewriteTemplate.lockedElements, ["竖屏构图", "户外热浪痛点", "手持真实感"], "reverse normalization preserves rewrite template");
 assert.strictEqual(state.reverseVideo.status, "ready", "reverse result marks workspace ready");
 
+const wrapperState = Core.migrateState(JSON.parse(JSON.stringify(state)));
+const wrapperReverseResult = Core.applyReverseStoryboardProviderResult(wrapperState, reverseRequest, {
+  ok: true,
+  result: {
+    title: "外层标题",
+    summary: "外层摘要",
+    sourceReconstruction: {
+      productIdentity: "外层产品身份",
+    },
+    reverseStoryboard: {
+      duration: 13,
+      hook: "外层响应里的钩子",
+      ratio: "9:16",
+    },
+    scenes: [
+      {
+        title: "外层分镜",
+        visual: "模型把 scenes 放在 reverseStoryboard 外层。",
+        subtitle: "Scene outside wrapper",
+        videoPrompt: "复刻外层 scenes。",
+      },
+    ],
+  },
+});
+assert.strictEqual(wrapperReverseResult.scenes[0].title, "外层分镜", "reverse normalization accepts wrapper-level scenes when reverseStoryboard omits scenes");
+assert.strictEqual(wrapperReverseResult.sourceReconstruction.productIdentity, "外层产品身份", "reverse normalization preserves wrapper-level source reconstruction");
+
 const reverseFavorite = Core.saveReverseStoryboardFavorite(state);
 assert.strictEqual(reverseFavorite.type, "分镜脚本", "reverse result saves as storyboard favorite");
 assert.strictEqual(reverseFavorite.sourceKey, "reverse-video:upload_verify", "reverse favorite stores source key");
@@ -632,12 +753,14 @@ state.reverseVideo.selectedProductId = "product-neck-fan-target";
 state.selectedProductId = "product-draft";
 state.reverseVideo.secondaryCount = 4;
 state.reverseVideo.creationStrategy = "hooks";
+state.contentBrief.videoResolution = "480p";
 const reverseCreatedTasksFromState = Core.createTasksFromReverseFavorite(state);
 assert.strictEqual(reverseCreatedTasksFromState.length, 4, "reverse secondary task count can come from workspace settings");
 assert.strictEqual(reverseCreatedTasksFromState[0].strategy, "hooks", "reverse secondary task strategy can come from workspace settings");
 assert.strictEqual(reverseCreatedTasksFromState[0].productId, "product-neck-fan-target", "reverse secondary tasks use the selected remix product");
 assert.strictEqual(reverseCreatedTasksFromState[0].productName, "可折叠挂脖风扇", "reverse secondary task product name comes from selected remix product");
 assert.ok(reverseCreatedTasksFromState[0].contentBrief.productPromise.includes("免手持"), "reverse secondary task content brief includes selected product selling points");
+assert.strictEqual(reverseCreatedTasksFromState[0].videoResolution, "480p", "secondary task records the selected video resolution");
 const reverseVideoProviderRequest = Core.buildVideoProviderRequest(state, reverseCreatedTasksFromState[0], Core.getById(state.products, "product-neck-fan-target"));
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("可折叠挂脖风扇"), "reverse video prompt includes selected product name");
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("免手持"), "reverse video prompt includes selected product facts");
@@ -646,6 +769,7 @@ assert.ok(reverseVideoProviderRequest.body.prompt.includes("旁白"), "reverse v
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("产品参考图为最高优先级"), "reverse video prompt locks the selected product reference image");
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("不得改变产品颜色、外观轮廓、比例、材质和关键结构"), "reverse video prompt forbids product appearance drift");
 assert.deepStrictEqual(reverseVideoProviderRequest.body.image_urls, ["https://example.test/target-neck-fan.png"], "reverse video request uses selected product image URL");
+assert.strictEqual(reverseVideoProviderRequest.body.resolution, "480p", "ToAPIS video request uses the selected resolution");
 
 const waterPurifierRequest = Core.buildVideoProviderRequest(
   state,
@@ -747,19 +871,25 @@ assert.strictEqual(repairedVideoState.tasks[0].status, "video_review", "migratio
 
 Core.approveVideo(created);
 Core.generateCopies(created, ["tiktok"]);
-assert.ok(created.copies.tiktok.title.includes(created.productName), "local copy fallback uses current product name");
+assertNoChineseText(created.copies.tiktok.title, "local copy fallback title");
 assertNoDemoWaterText(created.copies, "generated copy");
 assert.strictEqual(created.copies.tiktok.language, "en", "local copy fallback generates English publishing copy");
 assert.ok(created.copies.tiktok.chineseTranslation.includes("中文参考"), "local copy fallback includes Chinese reference translation");
 assert.ok(!created.copies.tiktok.body.includes("围绕"), "local copy fallback is not a Chinese video summary");
+assert.ok(!/[A-Za-z]{4,}/.test(created.copies.tiktok.chineseTranslation), "local copy fallback Chinese translation is fully Chinese");
+assert.ok(!/[A-Za-z]{4,}/.test(created.copies.tiktok.postingNotes), "local copy fallback posting notes are Chinese");
+assert.ok(created.copies.tiktok.complianceWarnings.every((item) => !/[A-Za-z]{4,}/.test(item)), "local copy fallback compliance warnings are Chinese");
+assert.ok(!/[A-Za-z]{4,}/.test(created.copies.tiktok.rationale), "local copy fallback rationale is Chinese");
 state.copyStyle = "problem-solution";
 const styledCopyRequest = Core.buildCopyProviderRequest(state, created, ["tiktok"]);
 const styledCopyPayload = userMessagePayload(styledCopyRequest);
 assert.strictEqual(styledCopyPayload.copyStyle.id, "problem-solution", "copy provider request includes selected copy style");
 assert.strictEqual(styledCopyPayload.language.publish, "English", "copy provider request requires English publishing copy");
 assert.strictEqual(styledCopyPayload.language.referenceTranslation, "Chinese", "copy provider request requires Chinese reference translation");
+assert.strictEqual(styledCopyPayload.language.internalReviewFields, "Chinese", "copy provider request requires Chinese internal review fields");
 assert.ok(styledCopyPayload.outputFields.includes("chineseTranslation"), "copy provider request asks for Chinese translation field");
 assert.ok(JSON.stringify(styledCopyRequest.body).includes("不要输出视频概述"), "copy provider request forbids video-summary captions");
+assert.ok(JSON.stringify(styledCopyRequest.body).includes("内部审核字段必须使用中文"), "copy provider request requires Chinese internal review fields");
 created.copies.tiktok.body = "原分镜脚本复用：Unknown White Gadget。展示 图片素材中的产品特征、用户想法中的卖点。";
 
 Core.approveCopy(created, "tiktok");
@@ -772,6 +902,212 @@ assert.deepStrictEqual(created.providerRequests.publisher.body.media_ids, ["medi
 assert.ok(!created.providerRequests.publisher.body.content.includes("原分镜脚本复用"), "publish payload removes internal reverse-workflow wording");
 assert.ok(!created.providerRequests.publisher.body.content.includes("Unknown White Gadget"), "publish payload removes unknown placeholder product wording");
 assert.ok(!created.providerRequests.publisher.body.content.includes("图片素材中的产品特征"), "publish payload removes internal product-material placeholder wording");
+
+const uploadMediaState = Core.createInitialState();
+uploadMediaState.integrations.publisher.accountIds = "2280";
+const uploadMediaTask = Core.createContentPlanTask(uploadMediaState, {
+  contentPlan: {
+    productUnderstanding: "轻便挂脖风扇。",
+    targetAudience: "美国 TikTok 用户。",
+    keySellingPoints: ["strong airflow"],
+    usageScenarios: ["kitchen"],
+    strategy: "痛点解决",
+    hook: "Hot kitchen",
+    reviewSummary: "准备发布。",
+    complianceNotes: [],
+  },
+});
+uploadMediaTask.video = { url: "https://example.test/video.mp4", provider: "toapis" };
+uploadMediaTask.providerResponses = { publisherMedia: { ok: true, mediaId: "media_from_upload" } };
+Core.approveVideo(uploadMediaTask);
+Core.generateCopies(uploadMediaTask, ["tiktok"], { style: "problem-solution" });
+Core.approveCopy(uploadMediaTask, "tiktok");
+const uploadMediaRequest = Core.buildPublishProviderRequest(uploadMediaState, uploadMediaTask);
+assert.deepStrictEqual(uploadMediaRequest.body.media_ids, ["media_from_upload"], "publish request reuses media id returned by publisher upload");
+
+const scheduledMediaState = Core.createInitialState();
+scheduledMediaState.integrations.publisher.accountIds = "2280";
+const scheduledMediaTask = Core.createContentPlanTask(scheduledMediaState, {
+  contentPlan: {
+    productUnderstanding: "轻便挂脖风扇。",
+    targetAudience: "美国 TikTok 用户。",
+    keySellingPoints: ["strong airflow"],
+    usageScenarios: ["kitchen"],
+    strategy: "痛点解决",
+    hook: "Hot kitchen",
+    reviewSummary: "准备发布。",
+    complianceNotes: [],
+  },
+});
+scheduledMediaTask.video = { url: "https://example.test/video.mp4", provider: "toapis" };
+Core.approveVideo(scheduledMediaTask);
+Core.generateCopies(scheduledMediaTask, ["tiktok"], { style: "problem-solution" });
+Core.approveCopy(scheduledMediaTask, "tiktok");
+scheduledMediaState.scheduledPosts = [{
+  id: "scheduled-media",
+  taskId: scheduledMediaTask.id,
+  platformId: "tiktok",
+  status: "scheduled",
+  mediaIds: ["media_from_scheduled_post"],
+}];
+const scheduledMediaRequest = Core.buildPublishProviderRequest(scheduledMediaState, scheduledMediaTask);
+assert.deepStrictEqual(scheduledMediaRequest.body.media_ids, ["media_from_scheduled_post"], "publish request reuses matching scheduled post media ids when live task media is empty");
+
+const scheduleState = Core.createInitialState();
+scheduleState.products[0].imageUrl = "https://example.test/neck-fan.png";
+scheduleState.contentBrief.seed = "TikTok neck fan test";
+scheduleState.integrations.publisher.accountIds = "2280";
+scheduleState.integrations.publisher.mediaIds = "media_1";
+scheduleState.integrations.publisher.endpoint = "https://app.posteverywhere.ai/api/v1/posts";
+scheduleState.integrations.publisher.apiKey = "publisher-secret-verify";
+const schedulableTask = Core.createContentPlanTask(scheduleState, {
+  contentPlan: {
+    productUnderstanding: "轻便挂脖风扇。",
+    targetAudience: "美国 TikTok 用户。",
+    keySellingPoints: ["strong airflow", "lightweight"],
+    usageScenarios: ["kitchen", "outdoor"],
+    strategy: "痛点解决",
+    hook: "Hot kitchen",
+    reviewSummary: "准备发布。",
+    complianceNotes: [],
+  },
+});
+schedulableTask.video = { url: "https://example.test/video.mp4", provider: "toapis" };
+Core.approveVideo(schedulableTask);
+Core.generateCopies(schedulableTask, ["tiktok"], { style: "problem-solution" });
+Core.approveCopy(schedulableTask, "tiktok");
+const scheduledPost = Core.createScheduledPost(scheduleState, schedulableTask, "tiktok", {
+  scheduledAt: "2026-06-12T09:30",
+  timezone: "Asia/Shanghai",
+});
+assert.strictEqual(scheduleState.scheduledPosts.length, 1, "scheduled post is persisted in queue");
+assert.strictEqual(scheduledPost.status, "scheduled", "new scheduled post starts as scheduled");
+assert.strictEqual(scheduledPost.taskId, schedulableTask.id, "scheduled post remembers task id");
+assert.strictEqual(scheduledPost.platformId, "tiktok", "scheduled post remembers platform");
+assert.strictEqual(scheduledPost.copySnapshot.title, schedulableTask.copies.tiktok.title, "scheduled post snapshots copy");
+assert.strictEqual(scheduledPost.videoSnapshot.url, schedulableTask.video.url, "scheduled post snapshots video");
+assert.deepStrictEqual(scheduledPost.accountIds, [2280], "scheduled post snapshots account ids");
+assert.strictEqual(scheduledPost.providerRequestPreview.body.scheduled_for, "2026-06-12T01:30:00.000Z", "scheduled post provider request uses PostEverywhere hosted scheduled_for time");
+assert.strictEqual(scheduledPost.providerRequestPreview.body.timezone, "UTC", "scheduled post provider request sends UTC timezone with UTC scheduled_for");
+assert.ok(scheduledPost.providerRequestPreview.body.content.includes(schedulableTask.copies.tiktok.title), "scheduled post snapshots publish request preview");
+const hostedScheduledPost = JSON.parse(JSON.stringify(scheduledPost));
+Core.applyScheduledPostProviderResult(hostedScheduledPost, {
+  ok: true,
+  upstream: {
+    data: {
+      data: {
+        post: {
+          post_id: "post-hosted-1",
+          status: "scheduled",
+          scheduled_for: "2026-06-12T01:30:00.000Z",
+          timezone: "UTC",
+        },
+      },
+    },
+  },
+});
+assert.strictEqual(hostedScheduledPost.status, "platform_scheduled", "scheduled post is marked as platform-hosted after provider accepts it");
+assert.strictEqual(hostedScheduledPost.platformPostId, "post-hosted-1", "scheduled post stores the PostEverywhere post id");
+assert.strictEqual(Core.dueScheduledPosts({ scheduledPosts: [hostedScheduledPost] }, "2026-06-12T01:30:00.000Z").length, 0, "platform-hosted scheduled posts are not locally due");
+const cancelHostedRequest = Core.buildCancelScheduledPostProviderRequest(scheduleState, hostedScheduledPost);
+assert.strictEqual(cancelHostedRequest.method, "DELETE", "hosted scheduled post cancellation uses PostEverywhere DELETE");
+assert.strictEqual(cancelHostedRequest.endpoint, "https://app.posteverywhere.ai/api/v1/posts/post-hosted-1", "hosted scheduled post cancellation targets the platform post id");
+assert.strictEqual(cancelHostedRequest.apiKey, scheduleState.integrations.publisher.apiKey, "hosted scheduled post cancellation preserves publisher auth");
+Core.applyCancelScheduledPostProviderResult(hostedScheduledPost, {
+  ok: true,
+  upstream: { status: 204, data: {} },
+});
+assert.strictEqual(hostedScheduledPost.status, "cancelled", "platform cancellation marks hosted scheduled post cancelled locally");
+assert.strictEqual(hostedScheduledPost.platformStatus, "cancelled", "platform cancellation snapshots cancelled platform status");
+assert.strictEqual(hostedScheduledPost.providerCancelResponse.upstream.status, 204, "platform cancellation stores provider response");
+const rescheduledHostedPost = JSON.parse(JSON.stringify(hostedScheduledPost));
+rescheduledHostedPost.status = "platform_scheduled";
+Core.reschedulePost({ scheduledPosts: [rescheduledHostedPost] }, rescheduledHostedPost.id, "2026-06-13T08:00", "Asia/Shanghai");
+const rescheduleHostedRequest = Core.buildRescheduleScheduledPostProviderRequest(scheduleState, rescheduledHostedPost);
+assert.strictEqual(rescheduleHostedRequest.method, "PATCH", "hosted scheduled post time update uses PostEverywhere PATCH");
+assert.strictEqual(rescheduleHostedRequest.endpoint, "https://app.posteverywhere.ai/api/v1/posts/post-hosted-1", "hosted scheduled post time update targets the platform post id");
+assert.deepStrictEqual(rescheduleHostedRequest.body, {
+  scheduled_for: "2026-06-13T00:00:00.000Z",
+  timezone: "UTC",
+}, "hosted scheduled post time update sends the new UTC scheduled time only");
+Core.applyRescheduleScheduledPostProviderResult(rescheduledHostedPost, {
+  ok: true,
+  upstream: {
+    data: {
+      data: {
+        post: {
+          post_id: "post-hosted-1",
+          status: "scheduled",
+          scheduled_for: "2026-06-13T00:00:00.000Z",
+          timezone: "UTC",
+        },
+      },
+    },
+  },
+});
+assert.strictEqual(rescheduledHostedPost.status, "platform_scheduled", "platform time update keeps hosted scheduled status");
+assert.strictEqual(rescheduledHostedPost.platformScheduledFor, "2026-06-13T00:00:00.000Z", "platform time update stores hosted scheduled time");
+schedulableTask.copies.tiktok.title = "Edited after scheduling";
+assert.notStrictEqual(scheduledPost.copySnapshot.title, schedulableTask.copies.tiktok.title, "scheduled post snapshot is stable after copy edits");
+assert.strictEqual(Core.scheduledPostStatusLabel("scheduled"), "已定时", "scheduled status has Chinese label");
+assert.strictEqual(Core.dueScheduledPosts(scheduleState, "2026-06-12T01:29:00.000Z").length, 0, "scheduled post is not due before scheduled time");
+assert.strictEqual(Core.dueScheduledPosts(scheduleState, "2026-06-12T01:30:00.000Z").length, 1, "scheduled post is due at scheduled time");
+Core.markDueScheduledPosts(scheduleState, "2026-06-12T01:30:00.000Z");
+assert.strictEqual(scheduleState.scheduledPosts[0].status, "due", "due scheduled posts are marked as waiting for publish");
+Core.reschedulePost(scheduleState, scheduledPost.id, "2026-06-13T08:00", "Asia/Shanghai");
+assert.strictEqual(scheduleState.scheduledPosts[0].status, "scheduled", "rescheduling moves due post back to scheduled");
+assert.ok(scheduleState.scheduledPosts[0].scheduledAt.includes("2026-06-13T00:00:00.000Z"), "rescheduling stores UTC ISO time");
+assert.strictEqual(scheduleState.scheduledPosts[0].providerRequestPreview.body.scheduled_for, "2026-06-13T00:00:00.000Z", "rescheduling updates hosted PostEverywhere scheduled_for time");
+Core.cancelScheduledPost(scheduleState, scheduledPost.id);
+assert.strictEqual(scheduleState.scheduledPosts[0].status, "cancelled", "cancel scheduled post updates status");
+
+const migratedScheduledState = Core.migrateState({
+  schemaVersion: 2,
+  scheduledPosts: "bad value",
+});
+assert.deepStrictEqual(migratedScheduledState.scheduledPosts, [], "migration repairs missing scheduled queue");
+
+const migratedCopyState = Core.migrateState({
+  schemaVersion: 2,
+  products: state.products,
+  favorites: [],
+  tasks: [
+    {
+      id: "task-old-copy",
+      productId: state.products[0].id,
+      productName: "挂脖风扇",
+      favoriteName: "未使用收藏",
+      strategy: "content-plan",
+      variation: { hook: "Hot kitchen" },
+      title: "挂脖风扇 · Hot kitchen",
+      status: "copy_review",
+      owner: "运营",
+      duration: 15,
+      ratio: "9:16",
+      copies: {
+        tiktok: {
+          platformId: "tiktok",
+          platformName: "TikTok",
+          title: "净饮机 summer check",
+          hook: "Hot kitchen, hands full, still need airflow.",
+          body: "Hot kitchen, sweaty face, zero patience. This hands-free fan keeps air moving while you cook, clean, or walk outside.",
+          cta: "Would you use this in the kitchen or outside?",
+          hashtags: ["NeckFan"],
+          chineseTranslation: "中文参考译文：\nNeck fan summer check\n厨房很热。 This hands-free fan keeps air moving.",
+          postingNotes: "Use 痛点解决 style. Keep the final caption in English.",
+          complianceWarnings: ["Confirm product airflow and lightweight claims are true"],
+          rationale: "TikTok uses English 痛点解决 style.",
+        },
+      },
+    },
+  ],
+});
+const migratedCopy = migratedCopyState.tasks[0].copies.tiktok;
+assertNoChineseText(migratedCopy.title, "migration repaired copy title");
+assert.ok(!/[A-Za-z]{4,}/.test(migratedCopy.chineseTranslation), "migration repairs old mixed-language Chinese translation");
+assert.ok(!/[A-Za-z]{4,}/.test(migratedCopy.postingNotes), "migration repairs old English posting notes");
+assert.ok(migratedCopy.complianceWarnings.every((item) => !/[A-Za-z]{4,}/.test(item)), "migration repairs old English compliance warnings");
+assert.ok(!/[A-Za-z]{4,}/.test(migratedCopy.rationale), "migration repairs old English rationale");
 
 Core.clearProductImage(state, state.products[0].id);
 assert.strictEqual(state.products[0].imageData, "", "clearProductImage removes uploaded image data");

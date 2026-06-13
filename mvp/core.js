@@ -11,6 +11,50 @@
     { id: "youtube", name: "YouTube Shorts", tone: "标题清楚、描述简洁", limit: 500 },
     { id: "threads", name: "Threads", tone: "真实分享、弱广告感", limit: 500 },
   ];
+  const publishPlatformIds = ["tiktok"];
+  const publishPlatforms = platforms.filter((platform) => publishPlatformIds.includes(platform.id));
+  const publishPlatformIdSet = new Set(publishPlatformIds);
+
+  function isPublishPlatformEnabled(platformId) {
+    return publishPlatformIdSet.has(platformId);
+  }
+
+  function normalizePublishPlatformIds(platformIds) {
+    const selected = Array.isArray(platformIds)
+      ? platformIds.filter((platformId) => isPublishPlatformEnabled(platformId))
+      : [];
+    return selected.length ? Array.from(new Set(selected)) : publishPlatformIds.slice();
+  }
+
+  function readableChineseOutputSpec(scope) {
+    return {
+      language: "zh-CN",
+      scope,
+      rules: [
+        "所有面向运营审核的可读字段必须使用简体中文，包括标题、策略、痛点、卖点、画面描述、字幕、旁白、屏幕文字、视频提示词、审核点和风险提示。",
+        "强制要求：整体可读文本至少 80% 为简体中文，不允许整段英文输出，不允许纯英文内容规划或纯英文分镜脚本。",
+        "只有 subtitle、screenText、voiceover 中直接面向美国 TikTok 观众的短句可以使用英文；标题、画面、运镜、动作、图片提示词、视频提示词、产品重点、审核点和风险提示必须中文为主。",
+        "TikTok、US、CTA、UGC、品牌名、产品英文名、英文屏幕文案可以保留英文，但必须放在中文句子里说明，不能整段英文输出。",
+        "如果用户输入中包含英文要求，先理解含义，再用中文表达给运营审核。",
+      ],
+      forbidden: [
+        "不要把产品理解、目标用户、内容策略、画面描述、视频提示词等可读字段写成整段英文。",
+        "不要输出纯英文段落或纯英文列表。",
+        "不要输出中英混杂到难以审核的正文。",
+      ],
+    };
+  }
+
+  function readableChineseSystemInstruction(scope) {
+    return [
+      "所有面向运营审核的可读字段必须使用简体中文。",
+      `适用范围：${scope}。`,
+      "强制要求：整体可读文本至少 80% 为简体中文，不允许整段英文输出。",
+      "只有 subtitle、screenText、voiceover 这类直接给美国观众看的短句可以少量英文；其他解释、画面、策略、提示词和审核字段必须中文为主。",
+      "允许保留 TikTok、US、UGC、CTA、品牌名、产品英文名或少量英文屏幕文案，但正文解释必须是中文。",
+      "如果用户原始想法是英文或包含英文营销语境，也要转写成运营能直接看懂和修改的中文。",
+    ].join("");
+  }
 
   const copyStyles = [
     { id: "ugc-real", label: "真实 UGC", instruction: "像真实用户随手分享，短句、口语、少广告腔。" },
@@ -117,6 +161,11 @@
     selectedTaskId: null,
     selectedPlatforms: ["tiktok"],
     copyStyle: "ugc-real",
+    publishMode: "immediate",
+    scheduleDate: "",
+    scheduleTime: "",
+    scheduleTimezone: "Asia/Shanghai",
+    scheduledPosts: [],
     contentBrief: {
       seed: "",
       text: "",
@@ -124,6 +173,7 @@
       storyboardDetailLevel: "detailed",
       videoBatchCount: 1,
       videoCreationStrategy: "original",
+      videoResolution: "720p",
     },
     reverseVideo: {
       upload: null,
@@ -198,6 +248,16 @@
     return integration;
   }
 
+  function normalizeVideoResolution(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    return ["480p", "720p", "1080p"].includes(normalized) ? normalized : "720p";
+  }
+
+  function providerVideoResolution(value, uppercase = false) {
+    const resolution = normalizeVideoResolution(value);
+    return uppercase ? resolution.toUpperCase() : resolution;
+  }
+
   function migrateState(input) {
     const base = createInitialState();
     const incoming = input && typeof input === "object" ? input : {};
@@ -207,9 +267,14 @@
     state.products = legacy ? base.products : (Array.isArray(state.products) && state.products.length ? state.products : base.products);
     state.favorites = legacy ? [] : (Array.isArray(state.favorites) ? state.favorites : []);
     state.tasks = legacy ? [] : (Array.isArray(state.tasks) ? state.tasks : []);
-    state.tasks = state.tasks.map((task) => repairSavedTaskTimestamps(repairSavedVideoTask(repairSavedContentPlanTask(task))));
-    state.selectedPlatforms = Array.isArray(state.selectedPlatforms) && state.selectedPlatforms.length ? state.selectedPlatforms : base.selectedPlatforms;
+    state.tasks = state.tasks.map((task) => repairSavedTaskTimestamps(repairSavedVideoTask(repairSavedCopyTask(repairSavedContentPlanTask(task)))));
+    state.scheduledPosts = legacy ? [] : (Array.isArray(state.scheduledPosts) ? state.scheduledPosts : []);
+    state.selectedPlatforms = normalizePublishPlatformIds(state.selectedPlatforms);
     state.copyStyle = copyStyles.some((style) => style.id === state.copyStyle) ? state.copyStyle : base.copyStyle;
+    state.publishMode = ["immediate", "scheduled"].includes(state.publishMode) ? state.publishMode : base.publishMode;
+    state.scheduleDate = state.scheduleDate || base.scheduleDate;
+    state.scheduleTime = state.scheduleTime || base.scheduleTime;
+    state.scheduleTimezone = state.scheduleTimezone || base.scheduleTimezone;
     state.products = state.products.map((product) => Object.assign({ detailsSaved: false }, product));
     state.favorites = state.favorites.map((favorite) => Object.assign({}, favorite, {
       type: favorite.type === legacyFavoriteType ? "分镜脚本" : favorite.type,
@@ -232,6 +297,7 @@
     if (state.newFavorite.type === legacyFavoriteType) state.newFavorite.type = "分镜脚本";
     state.contentBrief.videoBatchCount = Math.max(1, Math.min(Number(state.contentBrief.videoBatchCount || base.contentBrief.videoBatchCount), 10));
     state.contentBrief.videoCreationStrategy = state.contentBrief.videoCreationStrategy || base.contentBrief.videoCreationStrategy;
+    state.contentBrief.videoResolution = normalizeVideoResolution(state.contentBrief.videoResolution || base.contentBrief.videoResolution);
     state.reverseVideo = Object.assign({}, base.reverseVideo, state.reverseVideo || {});
     state.reverseVideo.frames = Array.isArray(state.reverseVideo.frames) ? state.reverseVideo.frames : [];
     state.reverseVideo.selectedProductId = state.reverseVideo.selectedProductId || state.selectedProductId || base.reverseVideo.selectedProductId;
@@ -437,12 +503,116 @@
     return materials;
   }
 
+  function listItemText(value) {
+    if (value === undefined || value === null || value === false) return "";
+    if (Array.isArray(value)) return value.map(listItemText).filter(Boolean).join("、");
+    if (typeof value === "object") {
+      return Object.entries(value)
+        .map(([key, item]) => {
+          const text = listItemText(item);
+          return text ? `${key}: ${text}` : "";
+        })
+        .filter(Boolean)
+        .join("；");
+    }
+    return String(value || "").trim();
+  }
+
   function splitList(value) {
-    if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+    if (Array.isArray(value)) return value.map(listItemText).filter(Boolean);
+    if (value && typeof value === "object") return [listItemText(value)].filter(Boolean);
     return String(value || "")
       .split(/[，,\n#]+/)
       .map((item) => item.trim())
       .filter(Boolean);
+  }
+
+  function containsChineseText(value) {
+    return /[\u3400-\u9fff]/.test(String(value || ""));
+  }
+
+  function englishCopyTitle(platformId) {
+    return platformId === "youtube" ? "Real Use in 15 Seconds" : "Summer Use Check";
+  }
+
+  function publisherAccountIds(integration) {
+    return splitList(integration && (integration.accountIds || integration.account_ids))
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+  }
+
+  function uniqueList(items) {
+    const seen = new Set();
+    return items.filter((item) => {
+      const value = String(item || "").trim();
+      if (!value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+  }
+
+  function publisherUploadMediaIds(task) {
+    const response = task && task.providerResponses && task.providerResponses.publisherMedia;
+    if (!response || response.ok === false) return [];
+    return splitList(response.mediaId || response.media_id || response.id || response.result?.media_id || response.result?.mediaId);
+  }
+
+  function scheduledPostMediaIds(state, task, platformIds) {
+    if (!state || !task || !Array.isArray(state.scheduledPosts)) return [];
+    const platformSet = new Set((platformIds || []).filter(Boolean));
+    const matchesPlatform = (post) => !platformSet.size || platformSet.has(post.platformId);
+    return uniqueList(state.scheduledPosts
+      .filter((post) => post && post.taskId === task.id && post.status !== "cancelled" && matchesPlatform(post))
+      .flatMap((post) => splitList(
+        post.mediaIds
+        || post.media_ids
+        || post.providerRequestPreview?.body?.media_ids
+        || post.videoSnapshot?.posteverywhereMediaId
+        || post.videoSnapshot?.mediaId
+      )));
+  }
+
+  function publishMediaIds(state, task, platformIds) {
+    const integration = state && state.integrations && state.integrations.publisher || {};
+    const sources = [
+      splitList(task && task.video && (task.video.posteverywhereMediaId || task.video.mediaId)),
+      publisherUploadMediaIds(task),
+      splitList(integration.mediaIds || integration.media_ids),
+      scheduledPostMediaIds(state, task, platformIds),
+    ];
+    const firstAvailable = sources.find((items) => items.length);
+    return firstAvailable ? uniqueList(firstAvailable) : [];
+  }
+
+  function timezoneOffsetMinutes(timezone) {
+    return {
+      UTC: 0,
+      "Asia/Shanghai": 480,
+      "America/Los_Angeles": -420,
+      "America/Chicago": -300,
+      "America/New_York": -240,
+    }[timezone] ?? 0;
+  }
+
+  function scheduledLocalToIso(localDateTime, timezone) {
+    const value = String(localDateTime || "").trim();
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+    if (!match) throw new Error("请选择有效的定时发布时间");
+    const [, year, month, day, hour, minute] = match.map(Number);
+    const utcMs = Date.UTC(year, month - 1, day, hour, minute) - timezoneOffsetMinutes(timezone) * 60000;
+    return new Date(utcMs).toISOString();
+  }
+
+  function scheduledIsoToLocal(iso, timezone) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return { date: "", time: "" };
+    const localMs = date.getTime() + timezoneOffsetMinutes(timezone) * 60000;
+    const shifted = new Date(localMs);
+    const pad = (value) => String(value).padStart(2, "0");
+    return {
+      date: `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`,
+      time: `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`,
+    };
   }
 
   function sanitizePublishText(value) {
@@ -729,11 +899,20 @@
     const visionFrames = usesVisionContent ? representativeVisionFrames(availableVisionFrames, 4) : [];
     const userContentForText = visionFrames.length ? metadataWithoutInlineImages(userContent) : userContent;
     if (apiStyle === "openai-responses") {
+      const userContentParts = visionFrames.length
+        ? [
+          { type: "input_text", text: JSON.stringify(userContentForText) },
+          ...visionFrames.map((frame) => ({
+            type: "input_image",
+            image_url: frame.dataUrl,
+          })),
+        ]
+        : JSON.stringify(userContentForText);
       return {
         model: integration.model,
         input: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: JSON.stringify(userContentForText) },
+          { role: "user", content: userContentParts },
         ],
         text: {
           format: {
@@ -791,6 +970,7 @@
       product: productAiContext(product),
       materials,
       seed: String(seedText || state.contentBrief.seed || "").trim(),
+      outputLanguage: readableChineseOutputSpec("content brief"),
       target: "生成一段可直接用于短视频分镜生成的内容策划文本，包含画面、节奏、场景、卖点和结尾转化。",
     };
     return {
@@ -800,7 +980,7 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, "你是短视频内容策划助手。根据产品资料、图片素材和用户要求，生成一段中文视频内容 brief。只输出结构化 JSON。", userContent, "content_brief", schema),
+      body: buildLlmBody(integration, `你是短视频内容策划助手。根据产品资料、图片素材和用户要求，生成一段中文视频内容 brief。${readableChineseSystemInstruction("content brief")}只输出结构化 JSON。`, userContent, "content_brief", schema),
     };
   }
 
@@ -819,6 +999,7 @@
       properties: {
         contentPlan: {
           type: "object",
+          description: "内容规划必须中文为主；除少量面向美国观众的英文短句外，运营审核字段至少 80% 使用简体中文，不允许整段英文输出。",
           additionalProperties: true,
           required: ["productUnderstanding", "targetAudience", "keySellingPoints", "strategy", "hook"],
           properties: {
@@ -851,6 +1032,7 @@
       market: "US",
       duration: 15,
       ratio: "9:16",
+      outputLanguage: readableChineseOutputSpec("content plan"),
       outputFields: [
         "productUnderstanding",
         "targetAudience",
@@ -878,7 +1060,7 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, "你是跨境电商短视频内容规划助手。根据用户想法和产品图生成完整、可审核、可人工修改的短视频内容规划。规划必须细到目标用户、痛点、卖点、视觉风格、节奏、必拍画面、禁用夸张表达和 CTA。不要输出分镜、镜头拆分、时间轴、字幕字段或视频生成提示词。只输出结构化 JSON，不要编造未经证实的功效。", userContent, "content_plan", schema),
+      body: buildLlmBody(integration, `你是跨境电商短视频内容规划助手。根据用户想法和产品图生成完整、可审核、可人工修改的短视频内容规划。规划必须细到目标用户、痛点、卖点、视觉风格、节奏、必拍画面、禁用夸张表达和 CTA。不要输出分镜、镜头拆分、时间轴、字幕字段或视频生成提示词。${readableChineseSystemInstruction("content plan 的所有可读字段")}只输出结构化 JSON，不要编造未经证实的功效。`, userContent, "content_plan", schema),
     };
   }
 
@@ -1051,6 +1233,7 @@
           type: "array",
           items: {
             type: "object",
+            description: "分镜任务必须中文为主；title、angle、strategy、reviewSummary 使用简体中文，不允许纯英文段落。",
             additionalProperties: true,
             required: ["angle", "hook", "duration", "scenes"],
             properties: {
@@ -1065,6 +1248,7 @@
                 type: "array",
                 items: {
                   type: "object",
+                  description: "单个镜头必须中文为主。只有 subtitle、screenText、voiceover 的观众短句可少量英文；visual、camera、motion、imagePrompt、videoPrompt、productFocus、reviewChecklist、riskNotes 必须中文为主。",
                   additionalProperties: true,
                   required: ["time", "title", "visual", "subtitle", "videoPrompt"],
                   properties: {
@@ -1104,6 +1288,7 @@
       count: options.count,
       duration: 15,
       ratio: "9:16",
+      outputLanguage: readableChineseOutputSpec("storyboard"),
       timingRequirements: {
         exactDurationSeconds: 15,
         mustCoverFullRange: "scenes must start at 0s and the final scene must end exactly at 15s",
@@ -1134,7 +1319,7 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, "你是短视频分镜策划助手。输出结构化 JSON，不夸大产品功效。先给内容策略，再给可审核、可编辑、可提交视频模型的完整分镜。每个 task 必须是 15 秒，分镜从 0s 开始，最后一个镜头必须精确结束在 15s。", userContent, "video_storyboard_batch", schema),
+      body: buildLlmBody(integration, `你是短视频分镜策划助手。输出结构化 JSON，不夸大产品功效。先给内容策略，再给可审核、可编辑、可提交视频模型的完整分镜。每个 task 必须是 15 秒，分镜从 0s 开始，最后一个镜头必须精确结束在 15s。${readableChineseSystemInstruction("分镜任务、镜头字段和视频提示词")}`, userContent, "video_storyboard_batch", schema),
     };
   }
 
@@ -1178,6 +1363,7 @@
           minItems: 1,
           items: {
             type: "object",
+            description: "按已确认内容规划生成的分镜任务必须中文为主；title、angle、strategy、reviewSummary 使用简体中文，不允许纯英文段落。",
             additionalProperties: true,
             required: ["angle", "hook", "duration", "scenes"],
             properties: {
@@ -1193,6 +1379,7 @@
                 maxItems: sceneCount,
                 items: {
                   type: "object",
+                  description: "按当前规划生成的单个镜头必须中文为主。只有 subtitle、screenText、voiceover 的观众短句可少量英文；visual、camera、motion、imagePrompt、videoPrompt、productFocus、reviewChecklist、riskNotes 必须中文为主。",
                   additionalProperties: true,
                   required: ["time", "title", "visual", "subtitle", "videoPrompt"],
                   properties: {
@@ -1233,6 +1420,7 @@
       detailInstruction: storyboardDetailLabel(detailLevel),
       duration,
       ratio: task.ratio || "9:16",
+      outputLanguage: readableChineseOutputSpec("storyboard from edited content plan"),
       timingRequirements: {
         exactDurationSeconds: duration,
         sceneCount,
@@ -1266,7 +1454,7 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, "你是短视频分镜策划助手。必须严格基于用户已经确认和修改过的 contentPlan 生成分镜，不要回到原始想法自由发挥。输出结构化 JSON。分镜要更细，镜头数量必须等于请求的 sceneCount，且完整覆盖指定时长。", userContent, "video_storyboard_batch", schema),
+      body: buildLlmBody(integration, `你是短视频分镜策划助手。必须严格基于用户已经确认和修改过的 contentPlan 生成分镜，不要回到原始想法自由发挥。输出结构化 JSON。分镜要更细，镜头数量必须等于请求的 sceneCount，且完整覆盖指定时长。${readableChineseSystemInstruction("按当前内容规划生成的分镜脚本、镜头字段和视频提示词")}`, userContent, "video_storyboard_batch", schema),
     };
   }
 
@@ -1318,6 +1506,7 @@
     task.storyboard = timedStoryboard;
     task.storyboardTimingStatus = timedStoryboard.timingStatus;
     task.duration = Number(task.duration || 15);
+    task.videoResolution = normalizeVideoResolution(task.videoResolution || task.contentBrief?.videoResolution || state.contentBrief?.videoResolution);
     const details = productAiContext(product);
     const productName = details.name || productDisplayName(product);
     const visualIdentity = productVisualIdentityPrompt(product, productName);
@@ -1382,7 +1571,7 @@
           input,
           parameters: {
             duration: isWan27 ? Math.max(2, Math.min(Number(task.duration || 5), 15)) : Math.min(Number(task.duration || 5), 5),
-            ...(isWan27 ? { resolution: "1080P", watermark: false } : {}),
+            ...(isWan27 ? { resolution: providerVideoResolution(task.videoResolution, true), watermark: false } : {}),
             prompt_extend: true,
           },
         },
@@ -1398,7 +1587,7 @@
         prompt: fullPrompt,
         duration: submittedDuration,
         aspect_ratio: task.ratio || "9:16",
-        resolution: viduQ3 ? "720p" : "720P",
+        resolution: providerVideoResolution(task.videoResolution, !viduQ3),
       };
       if (viduQ3) body.audio = true;
       if (/^https?:\/\//i.test(imageUrl)) {
@@ -1432,6 +1621,7 @@
         provider: integration.provider,
         duration: task.duration,
         ratio: task.ratio,
+        resolution: normalizeVideoResolution(task.videoResolution),
         image: product && product.imageData ? "local-product-image-data-url" : null,
         prompt: fullPrompt,
         negative_prompt: "blur, distorted product, wrong logo, unreadable text",
@@ -1461,13 +1651,12 @@
     };
   }
 
-  function buildPublishProviderRequest(state, task) {
+  function buildPublishProviderRequest(state, task, options = {}) {
     const integration = state.integrations.publisher;
-    const copies = Object.values(task.copies).filter((copy) => copy.approved);
-    const accountIds = splitList(integration.accountIds || integration.account_ids)
-      .map((id) => Number(id))
-      .filter((id) => Number.isInteger(id) && id > 0);
-    const mediaIds = splitList(integration.mediaIds || integration.media_ids || task.video?.posteverywhereMediaId || task.video?.mediaId);
+    const platformFilter = Array.isArray(options.platformIds) && options.platformIds.length ? new Set(options.platformIds) : null;
+    const copies = Object.values(task.copies).filter((copy) => copy.approved && isPublishPlatformEnabled(copy.platformId) && (!platformFilter || platformFilter.has(copy.platformId)));
+    const accountIds = publisherAccountIds(integration);
+    const mediaIds = publishMediaIds(state, task, copies.map((copy) => copy.platformId));
     const copyContent = (copy) => {
       const hashtags = Array.isArray(copy.hashtags) ? copy.hashtags : splitList(copy.hashtags);
       return [
@@ -1499,12 +1688,54 @@
       platform_content: platformContent,
     };
     if (mediaIds.length) body.media_ids = mediaIds;
+    if (options.scheduledAt) {
+      body.scheduled_for = options.scheduledAt;
+      body.timezone = "UTC";
+    }
     return {
       provider: integration.provider,
       mode: integration.mode,
       endpoint: integration.endpoint,
       apiKey: integration.apiKey,
       body,
+    };
+  }
+
+  function publisherPostEndpoint(endpoint, postId) {
+    const base = String(endpoint || "").trim().replace(/\/+$/, "");
+    if (!base) throw new Error("请先配置 PostEverywhere Endpoint。");
+    if (!postId) throw new Error("缺少 PostEverywhere post_id，无法操作平台定时。");
+    return `${base}/${encodeURIComponent(postId)}`;
+  }
+
+  function buildCancelScheduledPostProviderRequest(state, scheduledPost) {
+    const integration = state && state.integrations && state.integrations.publisher || {};
+    const preview = scheduledPost && scheduledPost.providerRequestPreview || {};
+    const postId = scheduledPost && scheduledPost.platformPostId;
+    return {
+      provider: integration.provider || preview.provider,
+      mode: integration.mode || preview.mode,
+      method: "DELETE",
+      endpoint: publisherPostEndpoint(integration.endpoint || preview.endpoint, postId),
+      apiKey: integration.apiKey || preview.apiKey,
+      body: null,
+    };
+  }
+
+  function buildRescheduleScheduledPostProviderRequest(state, scheduledPost) {
+    const integration = state && state.integrations && state.integrations.publisher || {};
+    const preview = scheduledPost && scheduledPost.providerRequestPreview || {};
+    const postId = scheduledPost && scheduledPost.platformPostId;
+    return {
+      provider: integration.provider || preview.provider,
+      mode: integration.mode || preview.mode,
+      method: "PATCH",
+      endpoint: publisherPostEndpoint(integration.endpoint || preview.endpoint, postId),
+      apiKey: integration.apiKey || preview.apiKey,
+      body: {
+        scheduled_for: scheduledPost && scheduledPost.scheduledAt,
+        timezone: "UTC",
+      },
     };
   }
 
@@ -1557,14 +1788,16 @@
         storyboard: task.storyboard,
         video: task.video,
       },
-      platforms: platforms.filter((platform) => platformIds.includes(platform.id)),
+      platforms: publishPlatforms.filter((platform) => normalizePublishPlatformIds(platformIds).includes(platform.id)),
       copyStyle: style,
       language: {
         publish: "English",
         referenceTranslation: "Chinese",
+        internalReviewFields: "Chinese",
         rules: [
           "实际发布的 title、hook、body、cta、hashtags 必须使用英文，可保留英文产品名或不写产品名。",
-          "chineseTranslation 只给审核人员参考，不会发布。",
+          "chineseTranslation 只给审核人员参考，不会发布，必须完整翻译成中文，不要夹杂英文句子。",
+          "postingNotes、complianceWarnings、rationale 是内部审核字段，必须使用中文。",
           "不要输出视频概述；要写成真实 TikTok/Reels/Shorts caption。",
         ],
       },
@@ -1593,7 +1826,7 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, "你是跨平台短视频文案助手。根据已审核的视频分镜，为每个平台生成可人工审核、可编辑、可发布的完整文案详情。实际发布字段必须是英文。中文只放在 chineseTranslation 供审核参考。不要输出视频概述，要写成平台上的真实 caption。只输出结构化 JSON。", userContent, "platform_copy_batch", schema),
+      body: buildLlmBody(integration, "你是跨平台短视频文案助手。根据已审核的视频分镜，为每个平台生成可人工审核、可编辑、可发布的完整文案详情。实际发布字段 title、hook、body、cta、hashtags 必须是英文。chineseTranslation、postingNotes、complianceWarnings、rationale 等内部审核字段必须使用中文。不要输出视频概述，要写成平台上的真实 caption。只输出结构化 JSON。", userContent, "platform_copy_batch", schema),
     };
   }
 
@@ -1743,6 +1976,100 @@
     return response;
   }
 
+  function collectProviderIssueText(value, parts = [], seen = new Set(), depth = 0) {
+    if (value === undefined || value === null || depth > 4) return parts;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      parts.push(String(value));
+      return parts;
+    }
+    if (value instanceof Error) {
+      parts.push(value.message || String(value));
+      return parts;
+    }
+    if (Array.isArray(value)) {
+      value.slice(0, 12).forEach((item) => collectProviderIssueText(item, parts, seen, depth + 1));
+      return parts;
+    }
+    if (typeof value !== "object" || seen.has(value)) return parts;
+    seen.add(value);
+    [
+      "error",
+      "message",
+      "code",
+      "type",
+      "status",
+      "task_status",
+      "providerStatus",
+      "providerCode",
+      "providerMessage",
+      "contentType",
+      "mimeType",
+      "raw",
+    ].forEach((key) => {
+      if (value[key] !== undefined) collectProviderIssueText(value[key], parts, seen, depth + 1);
+    });
+    Object.keys(value).forEach((key) => {
+      if (/apikey|api_key|authorization|token|secret/i.test(key)) return;
+      if (["error", "message", "code", "type", "status", "task_status", "providerStatus", "providerCode", "providerMessage", "contentType", "mimeType", "raw"].includes(key)) return;
+      collectProviderIssueText(value[key], parts, seen, depth + 1);
+    });
+    return parts;
+  }
+
+  function cleanProviderIssueText(value) {
+    return collectProviderIssueText(value)
+      .join(" ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function providerIssue(category, title, reason, action, rawMessage) {
+    return {
+      category,
+      title,
+      reason,
+      action,
+      rawMessage: String(rawMessage || "").slice(0, 260),
+    };
+  }
+
+  function explainProviderIssue(value, context = {}) {
+    const rawMessage = cleanProviderIssueText(value);
+    const text = rawMessage.toLowerCase();
+    const status = String(context.status || "").toLowerCase();
+    const kind = String(context.kind || "").toLowerCase();
+
+    if (/quota|quota_not_enough|insufficient|余额|套餐|credit/.test(text)) {
+      return providerIssue("quota", "余额不足", "当前模型或发布服务返回额度不足，任务没有继续执行。", "去对应 provider 后台充值，或在集成设置里切换到还有额度的模型后重试。", rawMessage);
+    }
+    if (/524|timeout|timed out|超时|deadline|etimedout/.test(text)) {
+      return providerIssue("timeout", "接口超时", "上游服务响应太慢或网关超时，本次结果不可靠。", "稍后重试；如果连续出现，先减少批量、缩短输入，或切换更稳定的 provider。", rawMessage);
+    }
+    if (/没有返回内容|空的流式响应|no content|empty|no usable|message\.content|output_text/.test(text)) {
+      return providerIssue("empty_response", "模型无返回", "模型请求成功到达上游，但没有返回可解析的内容。", "重新生成一次；如果连续出现，缩短内容规划、换模型，或检查响应格式是否要求 JSON。", rawMessage);
+    }
+    if (status === "video_generating" || /pending|processing|running|in_progress|queued|submitted|生成中|排队/.test(text)) {
+      return providerIssue("video_pending", "视频仍在生成", "视频任务已经提交，但上游还没有给出最终视频地址。", "稍后点击“查询视频结果”，不要重复提交同一个视频任务。", rawMessage);
+    }
+    if (/account_ids|account ids|账号 id|账号ID|workspace|缺少 posteverywhere 账号|publisher account/.test(text) || kind === "publisher" && /账号/.test(text)) {
+      return providerIssue("publisher_account", "发布账号没配置", "PostEverywhere 没有可用账号 ID，平台无法知道要发布到哪个账号。", "到“集成设置”填写 PostEverywhere 账号 ID，保存后回到发布页重试。", rawMessage);
+    }
+    if (/media_id|media ids|requires media|缺少 posteverywhere 媒体|缺媒体|未上传/.test(text)) {
+      return providerIssue("publisher_media", "发布媒体没上传", "TikTok 发布需要先把视频上传到 PostEverywhere 并拿到 media_id。", "在发布页点击“上传媒体”，成功后再确认发布。", rawMessage);
+    }
+    if (/mp4|video\/quicktime|video\/webm|content-type|mime|格式/.test(text) && /只支持|not supported|unsupported|不是|当前类型|requires|必须/.test(text)) {
+      return providerIssue("video_format", "视频格式不是 MP4", "发布接口当前只接受 MP4 视频，本次文件类型不符合要求。", "先把视频转成 MP4，或重新下载/上传 MP4 文件后再发布。", rawMessage);
+    }
+    if (/401|403|unauthorized|forbidden|invalid api key|api key|鉴权|权限|无权限/.test(text)) {
+      return providerIssue("auth", "接口权限异常", "上游拒绝了请求，常见原因是 API Key、模型权限或账号权限不正确。", "检查集成设置里的 API Key、endpoint、model 和账号权限，然后重新测试连接。", rawMessage);
+    }
+    if (/fetch failed|econnreset|enotfound|network|dns|getaddrinfo|连接失败|无法连接/.test(text)) {
+      return providerIssue("network", "网络或本地服务不可达", "请求没有稳定到达上游，可能是本地服务未启动、网络或网关连接失败。", "先确认本地服务健康，再检查 endpoint 是否完整、网络是否可访问。", rawMessage);
+    }
+    return providerIssue("unknown", "接口调用失败", "上游返回了未归类错误，系统已保留原始信息。", "查看错误详情；如果重复出现，把原始错误发给技术同事检查 provider 配置和返回格式。", rawMessage);
+  }
+
   function firstValue(object, keys, fallback = "") {
     if (!object || typeof object !== "object") return fallback;
     for (const key of keys) {
@@ -1808,15 +2135,17 @@
   function normalizeReverseStoryboard(source, upload) {
     const root = source && typeof source === "object" ? source : {};
     const story = root.reverseStoryboard || root.reverse_storyboard || root.storyboard || root.result || root;
-    const scenes = Array.isArray(story.scenes) ? story.scenes : (Array.isArray(story.storyboard) ? story.storyboard : []);
+    const scenes = Array.isArray(story.scenes)
+      ? story.scenes
+      : (Array.isArray(story.storyboard) ? story.storyboard : (Array.isArray(root.scenes) ? root.scenes : []));
     return {
-      title: firstValue(story, ["title", "name"], upload && upload.fileName ? `反推分镜 · ${upload.fileName}` : "反推分镜"),
-      summary: firstValue(story, ["summary", "reviewSummary", "review_summary", "strategy"], ""),
+      title: firstValue(story, ["title", "name"], firstValue(root, ["title", "name"], upload && upload.fileName ? `反推分镜 · ${upload.fileName}` : "反推分镜")),
+      summary: firstValue(story, ["summary", "reviewSummary", "review_summary", "strategy"], firstValue(root, ["summary", "reviewSummary", "review_summary", "strategy"], "")),
       hook: firstValue(story, ["hook", "opening"], ""),
       duration: Number(firstValue(story, ["duration"], 15)) || 15,
       ratio: firstValue(story, ["ratio", "aspectRatio", "aspect_ratio"], "9:16"),
-      sourceReconstruction: clone(firstValue(story, ["sourceReconstruction", "source_reconstruction"], {})),
-      rewriteTemplate: clone(firstValue(story, ["rewriteTemplate", "rewrite_template"], {})),
+      sourceReconstruction: clone(firstValue(story, ["sourceReconstruction", "source_reconstruction"], firstValue(root, ["sourceReconstruction", "source_reconstruction"], {}))),
+      rewriteTemplate: clone(firstValue(story, ["rewriteTemplate", "rewrite_template"], firstValue(root, ["rewriteTemplate", "rewrite_template"], {}))),
       scenes: scenes.map((scene, index) => sceneFromProvider(scene, {
         time: index === 0 ? "0-3s" : "",
         title: "分镜",
@@ -1879,11 +2208,45 @@
     return task;
   }
 
+  function repairSavedCopyTask(task) {
+    if (!task || typeof task !== "object" || !task.copies || typeof task.copies !== "object") return task;
+    Object.values(task.copies).forEach((copy) => {
+      if (!copy || typeof copy !== "object") return;
+      const body = String(copy.body || "");
+      const cta = String(copy.cta || "");
+      const styleLabel = copyStyleById(copy.copyStyle).label;
+      if (containsChineseText(copy.title)) {
+        copy.title = englishCopyTitle(copy.platformId);
+      }
+      if (!String(copy.chineseTranslation || "").trim() || /[A-Za-z]{4,}/.test(String(copy.chineseTranslation || ""))) {
+        copy.chineseTranslation = [
+          "中文参考译文：",
+          "夏季使用文案参考",
+          body.includes("Hot kitchen, sweaty face")
+            ? "厨房很热、满脸是汗，真的很容易没耐心。这款免手持风扇可以在做饭、清洁或户外走动时持续送风，佩戴起来比较轻，不太妨碍动作，风感也比较明显。"
+            : "这条文案用于参考发布正文含义，实际发布内容保持英文。",
+          cta.includes("kitchen") ? "你会在厨房用，还是出门用？" : "你会在室内用，还是户外用？",
+        ].join("\n");
+      }
+      if (!String(copy.postingNotes || "").trim() || /[A-Za-z]{4,}/.test(String(copy.postingNotes || ""))) {
+        copy.postingNotes = `使用「${styleLabel}」风格。实际发布文案保持英文，避免医疗暗示、孕期专用暗示和绝对降温承诺。`;
+      }
+      if (!Array.isArray(copy.complianceWarnings) || copy.complianceWarnings.some((item) => /[A-Za-z]{4,}/.test(String(item || "")))) {
+        copy.complianceWarnings = ["发布前确认风力强劲、重量轻等卖点与真实产品一致", "避免医疗、孕期专用或保证降温效果等未经证实的表述"];
+      }
+      if (!String(copy.rationale || "").trim() || /[A-Za-z]{4,}/.test(String(copy.rationale || ""))) {
+        copy.rationale = "当前平台使用英文发布正文，内部审核采用中文说明；文案用短句和低压互动提问替代视频概述。";
+      }
+    });
+    return task;
+  }
+
   function repairSavedTaskTimestamps(task) {
     if (!task || typeof task !== "object") return task;
     const fallback = task.updatedAt || task.createdAt || task.video?.generatedAt || new Date().toISOString();
     task.createdAt = task.createdAt || fallback;
     task.updatedAt = task.updatedAt || task.createdAt;
+    task.videoResolution = normalizeVideoResolution(task.videoResolution || task.contentBrief?.videoResolution);
     return task;
   }
 
@@ -1912,6 +2275,7 @@
       updatedAt: now,
       duration: 15,
       ratio: "9:16",
+      videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
       contentPlan,
       contentBrief: {
         audienceInsight: contentPlan.targetAudience,
@@ -1923,6 +2287,7 @@
         riskNotes: contentPlan.complianceNotes,
         seed: state.contentBrief && state.contentBrief.seed || "",
         text: contentPlan.strategy || "",
+        videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
       },
       strategySummary: contentPlan.strategy,
       reviewSummary: contentPlan.reviewSummary || contentPlan.complianceNotes.join("、"),
@@ -1962,7 +2327,11 @@
 
   function reverseStoryboardFromProviderResponse(response) {
     const result = providerResult(response);
-    return result && (result.reverseStoryboard || result.reverse_storyboard || result.storyboard || result);
+    if (!result || typeof result !== "object") return result;
+    if ((result.reverseStoryboard || result.reverse_storyboard) && (Array.isArray(result.scenes) || result.sourceReconstruction || result.source_reconstruction || result.rewriteTemplate || result.rewrite_template)) {
+      return result;
+    }
+    return result.reverseStoryboard || result.reverse_storyboard || result.storyboard || result;
   }
 
   function applyReverseStoryboardProviderResult(state, request, response) {
@@ -2108,6 +2477,7 @@
         updatedAt: now,
         duration: taskDuration,
         ratio: result && result.ratio || "9:16",
+        videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
         contentPlan: result ? {
           productUnderstanding: productContext.name || productDisplayName(product),
           targetAudience: productContext.audience || "",
@@ -2123,7 +2493,9 @@
           complianceNotes: [],
           scenes: cloneScenes(timedScenes),
         } : null,
-        contentBrief: createContentBriefSnapshot(product, favorite, { text: favorite.content }),
+        contentBrief: Object.assign(createContentBriefSnapshot(product, favorite, { text: favorite.content }), {
+          videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
+        }),
         strategySummary: result && result.summary || "基于反推分镜二次创作",
         sourceFidelityInstruction: "最大程度复刻参考视频的文案、语音、镜头角度、运镜节奏、构图和转化收尾。",
         reviewSummary: result && result.summary ? `${result.summary}\n最大程度复刻参考视频的文案、语音、镜头角度和动作节奏。` : "最大程度复刻参考视频的文案、语音、镜头角度和动作节奏。",
@@ -2150,6 +2522,7 @@
     }
     const count = Math.max(1, Math.min(Number(options.count || state.contentBrief && state.contentBrief.videoBatchCount || 1), 10));
     const strategy = options.strategy || state.contentBrief && state.contentBrief.videoCreationStrategy || "original";
+    const videoResolution = normalizeVideoResolution(options.videoResolution || sourceTask.videoResolution || sourceTask.contentBrief?.videoResolution || state.contentBrief && state.contentBrief.videoResolution);
     const now = new Date().toISOString();
     const tasks = Array.from({ length: count }, (_, index) => {
       const variation = buildVariation(index, strategy);
@@ -2170,8 +2543,9 @@
         updatedAt: now,
         duration: sourceTask.duration || 15,
         ratio: sourceTask.ratio || "9:16",
+        videoResolution,
         contentPlan: clone(sourceTask.contentPlan || null),
-        contentBrief: clone(sourceTask.contentBrief || {}),
+        contentBrief: Object.assign(clone(sourceTask.contentBrief || {}), { videoResolution }),
         strategySummary: sourceTask.strategySummary || sourceTask.contentPlan?.strategy || "",
         reviewSummary: sourceTask.reviewSummary || "",
         storyboard: cloneScenes(sourceTask.storyboard),
@@ -2285,7 +2659,8 @@
       providerResult: result,
     });
     if (["FAILED", "failed", "CANCELED", "canceled"].includes(providerStatus)) {
-      task.reviewNote = providerMessage ? `视频生成失败：${providerMessage}` : `视频生成失败：${providerStatus}`;
+      const issue = explainProviderIssue(response || { providerStatus, providerMessage, providerCode }, { kind: "video", status: providerStatus });
+      task.reviewNote = `${issue.title}：${issue.action}`;
       setTaskStatus(task, "rejected");
     } else if (url || ["SUCCEEDED", "succeeded", "success", "completed"].includes(providerStatus)) {
       setTaskStatus(task, "video_review");
@@ -2308,7 +2683,7 @@
         platformName: copy.platformName || (platform && platform.name) || platformId,
         language: copy.language || "en",
         copyStyle: copy.copyStyle || copy.copy_style || "",
-        title: copy.title || "",
+        title: containsChineseText(copy.title) ? englishCopyTitle(platformId) : copy.title || englishCopyTitle(platformId),
         hook: copy.hook || "",
         body: copy.body || "",
         cta: copy.cta || "",
@@ -2342,6 +2717,56 @@
       return acc;
     }, {});
     return Object.keys(task.publishResults).length > 0;
+  }
+
+  function providerPostResult(response) {
+    const result = providerResult(response);
+    const data = result && result.data || result;
+    if (!data) return null;
+    if (Array.isArray(data.posts) && data.posts[0]) return data.posts[0];
+    if (data.post) return data.post;
+    if (data.result && data.result.post) return data.result.post;
+    if (data.post_id || data.id || data.status || data.post_status || data.scheduled_for) return data;
+    return null;
+  }
+
+  function applyScheduledPostProviderResult(scheduledPost, response) {
+    if (!scheduledPost) return null;
+    scheduledPost.providerResponse = response;
+    const post = providerPostResult(response) || {};
+    scheduledPost.platformPostId = post.post_id || post.id || "";
+    scheduledPost.platformStatus = post.post_status || post.status || "";
+    scheduledPost.platformScheduledFor = post.scheduled_for || scheduledPost.scheduledAt;
+    scheduledPost.platformTimezone = post.timezone || "UTC";
+    scheduledPost.status = /fail|error|reject/i.test(String(scheduledPost.platformStatus)) ? "failed" : "platform_scheduled";
+    scheduledPost.updatedAt = new Date().toISOString();
+    return scheduledPost;
+  }
+
+  function applyCancelScheduledPostProviderResult(scheduledPost, response) {
+    if (!scheduledPost) return null;
+    const now = new Date().toISOString();
+    const post = providerPostResult(response) || {};
+    scheduledPost.providerCancelResponse = response;
+    scheduledPost.platformStatus = post.post_status || post.status || "cancelled";
+    scheduledPost.status = response && response.ok === false ? "failed" : "cancelled";
+    scheduledPost.platformCancelledAt = now;
+    scheduledPost.updatedAt = now;
+    return scheduledPost;
+  }
+
+  function applyRescheduleScheduledPostProviderResult(scheduledPost, response) {
+    if (!scheduledPost) return null;
+    const post = providerPostResult(response) || {};
+    scheduledPost.providerRescheduleResponse = response;
+    scheduledPost.platformStatus = post.post_status || post.status || "scheduled";
+    scheduledPost.platformScheduledFor = post.scheduled_for || scheduledPost.scheduledAt;
+    scheduledPost.platformTimezone = post.timezone || "UTC";
+    scheduledPost.status = response && response.ok === false || /fail|error|reject/i.test(String(scheduledPost.platformStatus))
+      ? "failed"
+      : "platform_scheduled";
+    scheduledPost.updatedAt = new Date().toISOString();
+    return scheduledPost;
   }
 
   function createBatchTasks(state, options) {
@@ -2390,9 +2815,7 @@
       if (/便携|portable/.test(text)) return "easy to wear";
       return "real everyday use";
     });
-    const title = platform.id === "youtube"
-      ? `${productName} in real use`
-      : `${productName} summer check`;
+    const title = englishCopyTitle(platform.id);
     const styleBodies = {
       "problem-solution": `Hot kitchen, sweaty face, zero patience. This hands-free fan keeps air moving while you cook, clean, or walk outside. It feels light, stays out of the way, and the airflow is easy to notice.`,
       "soft-sell": `If you get hot while cooking, walking, or running errands, this is worth checking out. It sits around your neck, feels lightweight, and keeps your hands free.`,
@@ -2405,16 +2828,22 @@
     const hashtags = platform.id === "threads"
       ? ["NeckFan", "SummerFinds"]
       : ["NeckFan", "StayCool", "KitchenHack", "SummerFinds", "TikTokShop"];
+    const chineseBodies = {
+      "problem-solution": "厨房很热、满脸是汗，真的很容易没耐心。这款免手持风扇可以在做饭、清洁或户外走动时持续送风，佩戴起来比较轻，不太妨碍动作，风感也比较明显。",
+      "soft-sell": "如果你在做饭、散步或出门办事时容易觉得热，这款挂脖风扇可以看看。它戴在脖子上，体感比较轻，也不用占用双手。",
+      funny: "当厨房热到需要一个救场小工具时，这款挂脖风扇可以制造轻松的剧情反差。它比较轻、免手持，风感在画面里也容易被看见。",
+      comparison: "使用前是在闷热厨房里忙到腾不出手；使用后是戴着挂脖风扇继续做饭和走动。表达重点是轻便、免手持和可见的风感，不做绝对效果承诺。",
+      "ugc-real": "在很热的厨房做饭真的不轻松。这款免手持挂脖风扇可以在忙的时候持续送风，不需要手拿。整体比较轻，使用方式简单，比预想中更实用。",
+    };
+    const chineseTitle = `${productName} 夏季使用文案参考`;
+    const chineseHook = platform.id === "instagram" ? "真实夏季使用场景，不像精修广告。" : "厨房很热、双手很忙，但还是需要有风。";
+    const chineseCta = cta === "Would you use this in the kitchen or outside?" ? "你会在厨房用，还是出门用？" : "你会在室内用，还是户外用？";
     const chineseTranslation = [
       "中文参考译文：",
-      `${title}`,
-      body
-        .replace("Cooking in a hot kitchen is no joke.", "在很热的厨房做饭真的不轻松。")
-        .replace("Hot kitchen, sweaty face, zero patience.", "厨房很热、满脸是汗，真的很容易没耐心。")
-        .replace("If you get hot while cooking, walking, or running errands, this is worth checking out.", "如果你做饭、散步或出门办事时容易热，这个可以看看。")
-        .replace("When the kitchen is too hot and you need an emergency rescue.", "当厨房热到需要一个救场小工具。")
-        .replace("Before: stuck in a hot kitchen with no hands free. After: wearing a neck fan while still cooking and moving around.", "使用前：厨房很热还腾不出手。使用后：戴着挂脖风扇也能继续做饭和走动。"),
-      cta === "Would you use this in the kitchen or outside?" ? "你会在厨房用，还是出门用？" : "你会在室内用，还是户外用？",
+      chineseTitle,
+      chineseHook,
+      chineseBodies[style.id] || chineseBodies["ugc-real"],
+      chineseCta,
     ].join("\n");
     return {
       platformId,
@@ -2430,9 +2859,9 @@
       coverTitle: platform.id === "youtube" ? `${productName} in 15 sec` : "Too hot to cook?",
       overlayText: englishProof.slice(0, 3),
       firstComment: cta,
-      postingNotes: sanitizePublishText(`Use ${style.label} style. Keep the final caption in English and avoid making medical or guaranteed cooling claims.`),
-      complianceWarnings: ["Confirm product airflow and lightweight claims are true", "Avoid medical, pregnancy-specific, or guaranteed cooling claims"],
-      rationale: `${platform.name} uses English ${style.label} style, short caption lines, and a low-pressure question CTA instead of a video summary.`,
+      postingNotes: sanitizePublishText(`使用「${style.label}」风格。实际发布文案保持英文，避免医疗暗示、孕期专用暗示和绝对降温承诺。`),
+      complianceWarnings: ["发布前确认风力强劲、重量轻等卖点与真实产品一致", "避免医疗、孕期专用或保证降温效果等未经证实的表述"],
+      rationale: "当前平台使用英文发布正文，内部审核采用中文说明；文案用短句和低压互动提问替代视频概述。",
       approved: false,
       limit: platform.limit,
     };
@@ -2441,7 +2870,7 @@
   function generateCopies(task, platformIds, options = {}) {
     task.copyStyle = options.style || task.copyStyle || "ugc-real";
     task.copySummary = `${task.productName} short-video captions are generated in English with Chinese reference translations for review.`;
-    platformIds.forEach((platformId) => {
+    normalizePublishPlatformIds(platformIds).forEach((platformId) => {
       task.copies[platformId] = generateCopy(task, platformId);
     });
     return task;
@@ -2451,7 +2880,8 @@
     if (task.copies[platformId]) {
       task.copies[platformId].approved = true;
     }
-    const allApproved = Object.values(task.copies).length > 0 && Object.values(task.copies).every((copy) => copy.approved);
+    const publishCopies = Object.values(task.copies).filter((copy) => isPublishPlatformEnabled(copy.platformId));
+    const allApproved = publishCopies.length > 0 && publishCopies.every((copy) => copy.approved);
     if (allApproved) {
       setTaskStatus(task, "ready_to_publish");
     }
@@ -2459,7 +2889,7 @@
   }
 
   function publishTask(state, task) {
-    const approvedCopies = Object.values(task.copies).filter((copy) => copy.approved);
+    const approvedCopies = Object.values(task.copies).filter((copy) => copy.approved && isPublishPlatformEnabled(copy.platformId));
     task.providerRequests = task.providerRequests || {};
     task.providerRequests.publisher = buildPublishProviderRequest(state, task);
     task.publishResults = approvedCopies.reduce((acc, copy) => {
@@ -2472,6 +2902,99 @@
       return acc;
     }, {});
     return setTaskStatus(task, "published");
+  }
+
+  function createScheduledPost(state, task, platformId, options) {
+    if (!state || !task) throw new Error("缺少可定时发布的任务");
+    const copy = task.copies && task.copies[platformId];
+    if (!copy || !copy.approved) throw new Error("请先通过要定时发布的平台文案");
+    if (!task.video || !task.video.url) throw new Error("请先生成并审核视频");
+    const timezone = (options && options.timezone) || state.scheduleTimezone || "Asia/Shanghai";
+    const scheduledAt = scheduledLocalToIso((options && options.scheduledAt) || `${state.scheduleDate}T${state.scheduleTime}`, timezone);
+    const copySnapshot = clone(copy);
+    const previewTask = Object.assign({}, task, { copies: { [platformId]: copySnapshot } });
+    const providerRequestPreview = buildPublishProviderRequest(state, previewTask, {
+      platformIds: [platformId],
+      scheduledAt,
+      timezone,
+    });
+    const now = new Date().toISOString();
+    const scheduledPost = {
+      id: uid("scheduled-post"),
+      taskId: task.id,
+      taskTitle: task.title || "",
+      productName: task.productName || "",
+      platformId,
+      platformName: copy.platformName || platformId,
+      copySnapshot,
+      videoSnapshot: clone(task.video),
+      accountIds: publisherAccountIds(state.integrations.publisher),
+      mediaIds: publishMediaIds(state, task, [platformId]),
+      scheduledAt,
+      timezone,
+      status: "scheduled",
+      schedulingMode: "posteverywhere",
+      providerRequestPreview,
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.scheduledPosts = Array.isArray(state.scheduledPosts) ? state.scheduledPosts : [];
+    state.scheduledPosts.unshift(scheduledPost);
+    return scheduledPost;
+  }
+
+  function scheduledPostById(state, id) {
+    return (state.scheduledPosts || []).find((item) => item.id === id) || null;
+  }
+
+  function cancelScheduledPost(state, id) {
+    const scheduledPost = scheduledPostById(state, id);
+    if (!scheduledPost) return null;
+    scheduledPost.status = "cancelled";
+    scheduledPost.updatedAt = new Date().toISOString();
+    return scheduledPost;
+  }
+
+  function reschedulePost(state, id, localDateTime, timezone) {
+    const scheduledPost = scheduledPostById(state, id);
+    if (!scheduledPost) return null;
+    scheduledPost.timezone = timezone || scheduledPost.timezone || "Asia/Shanghai";
+    scheduledPost.scheduledAt = scheduledLocalToIso(localDateTime, scheduledPost.timezone);
+    scheduledPost.status = "scheduled";
+    scheduledPost.schedulingMode = "posteverywhere";
+    if (scheduledPost.providerRequestPreview && scheduledPost.providerRequestPreview.body) {
+      scheduledPost.providerRequestPreview.body.scheduled_for = scheduledPost.scheduledAt;
+      scheduledPost.providerRequestPreview.body.timezone = "UTC";
+    }
+    scheduledPost.updatedAt = new Date().toISOString();
+    return scheduledPost;
+  }
+
+  function dueScheduledPosts(state, nowIso) {
+    const now = new Date(nowIso || new Date().toISOString()).getTime();
+    return (state.scheduledPosts || []).filter((item) => item.status === "scheduled" && new Date(item.scheduledAt).getTime() <= now);
+  }
+
+  function markDueScheduledPosts(state, nowIso) {
+    const due = dueScheduledPosts(state, nowIso);
+    const now = new Date().toISOString();
+    due.forEach((item) => {
+      item.status = "due";
+      item.updatedAt = now;
+    });
+    return due;
+  }
+
+  function scheduledPostStatusLabel(status) {
+    return {
+      scheduled: "已定时",
+      due: "待发布",
+      platform_scheduled: "平台托管",
+      publishing: "发布中",
+      published: "已发布",
+      failed: "发布失败",
+      cancelled: "已取消",
+    }[status] || status;
   }
 
   function deleteTask(state, taskId) {
@@ -2538,6 +3061,8 @@
 
   return {
     platforms,
+    publishPlatforms,
+    normalizePublishPlatformIds,
     copyStyles,
     llmProviders,
     videoProviders,
@@ -2563,8 +3088,12 @@
     buildVideoProviderRequest,
     buildVideoStatusProviderRequest,
     buildPublishProviderRequest,
+    buildCancelScheduledPostProviderRequest,
+    buildRescheduleScheduledPostProviderRequest,
+    publishMediaIds,
     buildCopyProviderRequest,
     sanitizePublishText,
+    explainProviderIssue,
     normalizeStoryboardTiming,
     applyContentBriefProviderResult,
     applyContentPlanProviderResult,
@@ -2573,6 +3102,9 @@
     applyVideoProviderResult,
     applyCopyProviderResult,
     applyPublishProviderResult,
+    applyScheduledPostProviderResult,
+    applyCancelScheduledPostProviderResult,
+    applyRescheduleScheduledPostProviderResult,
     createContentPlanTask,
     reverseStoryboardText,
     saveReverseStoryboardFavorite,
@@ -2584,6 +3116,13 @@
     generateCopies,
     approveCopy,
     publishTask,
+    createScheduledPost,
+    cancelScheduledPost,
+    reschedulePost,
+    dueScheduledPosts,
+    markDueScheduledPosts,
+    scheduledPostStatusLabel,
+    scheduledIsoToLocal,
     deleteTask,
     deleteFavorite,
     clearProductImage,

@@ -92,9 +92,26 @@ function logProviderEvent(event) {
   }
 }
 
+function providerErrorMessage(error) {
+  const message = error && error.message ? error.message : String(error || "provider failed");
+  const cause = error && error.cause;
+  const causeParts = [
+    cause && cause.code,
+    cause && cause.message && cause.message !== message ? cause.message : "",
+  ].filter(Boolean);
+  return causeParts.length ? `${message} (${causeParts.join(": ")})` : message;
+}
+
 async function proxyHttp(providerRequest) {
   if (!providerRequest.endpoint) {
     throw new Error("http mode requires endpoint");
+  }
+  const body = providerRequest.body && typeof providerRequest.body === "object"
+    ? { ...providerRequest.body }
+    : providerRequest.body;
+  const isOpenAiLike = body && typeof body === "object" && (Array.isArray(body.messages) || Array.isArray(body.input));
+  if (isOpenAiLike && body.stream === undefined) {
+    body.stream = false;
   }
   const headers = {
     "content-type": "application/json",
@@ -103,20 +120,31 @@ async function proxyHttp(providerRequest) {
   if (providerRequest.apiKey) {
     headers.authorization = `Bearer ${providerRequest.apiKey}`;
   }
-  const method = providerRequest.method || "POST";
+  const method = String(providerRequest.method || "POST").toUpperCase();
+  const shouldSendBody = !["GET", "HEAD", "DELETE"].includes(method);
   const response = await fetch(providerRequest.endpoint, {
     method,
     headers,
-    body: method === "GET" ? undefined : JSON.stringify(providerRequest.body || {}),
+    body: shouldSendBody ? JSON.stringify(body || {}) : undefined,
   });
   const text = await response.text();
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
+  let ok = response.ok;
+  if (/^\s*data:/m.test(text)) {
+    const parsedStream = openAiLikeSseTextData(providerRequest, text);
+    data = parsedStream.data;
+    if (!parsedStream.hasContent && !embeddedUpstreamErrorMessage({ status: response.status, ok: response.ok, data })) {
+      data = { error: { message: "上游没有返回内容：收到空的流式响应，没有 message.content 或 output_text。" }, raw: text.slice(0, 500) };
+      ok = false;
+    }
+  } else {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
   }
-  return { status: response.status, ok: response.ok, data };
+  return { status: response.status, ok, data };
 }
 
 function providerHeaders(providerRequest) {
@@ -183,6 +211,31 @@ function openAiLikeStreamData(providerRequest, content) {
         message: { content },
       },
     ],
+  };
+}
+
+function openAiLikeSseTextData(providerRequest, text) {
+  let streamedText = "";
+  const payloads = [];
+  String(text || "").split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(data);
+      payloads.push(parsed);
+      streamedText += streamTextFromSsePayload(parsed);
+    } catch {
+      // Ignore non-JSON stream housekeeping lines.
+    }
+  });
+  if (streamedText) {
+    return { hasContent: true, data: openAiLikeStreamData(providerRequest, streamedText) };
+  }
+  return {
+    hasContent: false,
+    data: payloads.length ? { raw: text, streamPayloads: payloads } : { raw: text },
   };
 }
 
@@ -260,7 +313,9 @@ async function proxyHttpStream(providerRequest, onEvent) {
       data = { raw: text };
     }
   }
-  return { status: response.status, ok: response.ok, data };
+  const proxied = { status: response.status, ok: response.ok, data };
+  const embeddedError = embeddedUpstreamErrorMessage(proxied);
+  return { status: response.status, ok: response.ok && !embeddedError, data };
 }
 
 function redactProxyData(data) {
@@ -296,6 +351,27 @@ function upstreamErrorMessage(proxied) {
       }
     }
     return data.raw.slice(0, 180);
+  }
+  return "";
+}
+
+function embeddedUpstreamErrorMessage(proxied) {
+  const data = proxied && proxied.data;
+  if (!data || typeof data !== "object") return "";
+  if (data.error && typeof data.error === "object" && data.error.message) return data.error.message;
+  if (data.error && typeof data.error === "string") return data.error;
+  if (data.response && data.response.error && data.response.error.message) return data.response.error.message;
+  if (typeof data.raw !== "string") return "";
+  const lines = data.raw.split(/\n+/).map((line) => line.trim()).filter((line) => line.startsWith("{"));
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.error && typeof parsed.error === "object" && parsed.error.message) return parsed.error.message;
+      if (parsed.error && typeof parsed.error === "string") return parsed.error;
+      if (parsed.response && parsed.response.error && parsed.response.error.message) return parsed.response.error.message;
+    } catch {
+      // Keep scanning later lines; upstreams sometimes append usage JSON after errors.
+    }
   }
   return "";
 }
@@ -364,6 +440,184 @@ async function handleVideoDownload(req, res) {
     });
   } catch (error) {
     sendJson(res, 400, { ok: false, error: error.message });
+  }
+}
+
+function publisherApiUrl(postsEndpoint, pathName) {
+  const endpoint = new URL(String(postsEndpoint || "").trim());
+  let basePath = endpoint.pathname.replace(/\/+$/, "");
+  if (/\/posts$/i.test(basePath)) {
+    basePath = basePath.replace(/\/posts$/i, "");
+  }
+  const childPath = String(pathName || "").replace(/^\/+/, "");
+  endpoint.pathname = `${basePath}/${childPath}`.replace(/\/+/g, "/");
+  endpoint.search = "";
+  endpoint.hash = "";
+  return endpoint.toString();
+}
+
+function mimeFromFilename(filename) {
+  const contentType = types[path.extname(String(filename || "")).toLowerCase()] || "application/octet-stream";
+  return contentType.split(";")[0];
+}
+
+function outputUrlToPath(sourceUrl) {
+  const pathname = decodeURIComponent(new URL(String(sourceUrl || ""), "http://localhost").pathname);
+  if (!pathname.startsWith("/outputs/")) {
+    throw new Error("只允许上传本地 outputs 目录内的视频。");
+  }
+  const relative = pathname.slice("/outputs/".length);
+  const filePath = path.normalize(path.join(OUTPUTS_ROOT, relative));
+  if (!isInside(OUTPUTS_ROOT, filePath)) {
+    throw new Error("视频路径无效。");
+  }
+  return filePath;
+}
+
+async function readPublisherMediaSource(sourceUrl) {
+  const source = String(sourceUrl || "").trim();
+  if (!source) {
+    throw new Error("缺少要上传的视频地址。");
+  }
+  if (source.startsWith("/outputs/")) {
+    const filePath = outputUrlToPath(source);
+    if (!fs.existsSync(filePath)) {
+      throw new Error("没有找到要上传的视频文件。");
+    }
+    const bytes = fs.readFileSync(filePath);
+    return {
+      bytes,
+      filename: path.basename(filePath),
+      contentType: mimeFromFilename(filePath),
+    };
+  }
+  if (/^https?:\/\//i.test(source)) {
+    const response = await fetch(source);
+    if (!response.ok) {
+      throw new Error(`视频下载失败，HTTP ${response.status}`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    return {
+      bytes,
+      filename: safeName(path.basename(new URL(source).pathname), "publisher-video.mp4"),
+      contentType: String(response.headers.get("content-type") || mimeFromFilename(source)).split(";")[0],
+    };
+  }
+  throw new Error("视频地址必须是 /outputs/ 本地文件或 http/https 下载地址。");
+}
+
+function publisherMediaData(data) {
+  if (!data || typeof data !== "object") return {};
+  return data.data && typeof data.data === "object" ? data.data : data;
+}
+
+async function uploadBytesToPublisher(uploadData, bytes, contentType) {
+  const uploadUrl = uploadData.upload_url || uploadData.uploadUrl;
+  if (!uploadUrl) {
+    throw new Error("PostEverywhere 没有返回 upload_url。");
+  }
+  const uploadMethod = uploadData.upload_method || uploadData.uploadMethod || {};
+  const method = String(uploadMethod.method || "PUT").toUpperCase();
+  const headers = Object.assign({}, uploadMethod.headers || {});
+  if (method === "PUT") {
+    headers["content-type"] = uploadMethod.content_type || uploadMethod.contentType || contentType;
+    const response = await fetch(uploadUrl, { method, headers, body: bytes });
+    if (!response.ok) {
+      throw new Error(`上传视频到 PostEverywhere 失败，HTTP ${response.status}`);
+    }
+    return { status: response.status, method };
+  }
+  if (method === "POST") {
+    const fieldName = uploadMethod.field_name || uploadMethod.fieldName || "file";
+    const formData = new FormData();
+    formData.append(fieldName, new Blob([bytes], { type: contentType }), uploadData.filename || "publisher-video.mp4");
+    const response = await fetch(uploadUrl, { method, headers, body: formData });
+    if (!response.ok) {
+      throw new Error(`上传视频到 PostEverywhere 失败，HTTP ${response.status}`);
+    }
+    return { status: response.status, method };
+  }
+  throw new Error(`不支持的 PostEverywhere 上传方法：${method}`);
+}
+
+async function handlePublisherMediaUpload(req, res) {
+  let endpoint = "";
+  try {
+    const payload = await readBody(req);
+    endpoint = String(payload.endpoint || "").trim();
+    const apiKey = String(payload.apiKey || "").trim();
+    if (!endpoint) throw new Error("请先配置 PostEverywhere Endpoint。");
+    if (!apiKey) throw new Error("请先配置 PostEverywhere API Key。");
+    const source = await readPublisherMediaSource(payload.sourceUrl);
+    if (!source.bytes.length) {
+      throw new Error("要上传的视频为空。");
+    }
+    const contentType = String(payload.contentType || source.contentType || "video/mp4").split(";")[0].trim().toLowerCase();
+    if (contentType !== "video/mp4") {
+      throw new Error(`PostEverywhere TikTok 视频上传当前只支持 MP4，请先转成 video/mp4。当前类型：${contentType || "未知"}`);
+    }
+    const filename = safeName(payload.filename || source.filename || "publisher-video.mp4", "publisher-video.mp4");
+    const uploadInit = await proxyHttp({
+      provider: "posteverywhere",
+      mode: "http",
+      endpoint: publisherApiUrl(endpoint, "/media/upload"),
+      apiKey,
+      body: {
+        filename,
+        content_type: contentType,
+        size: source.bytes.length,
+      },
+    });
+    if (!uploadInit.ok) {
+      throw new Error(upstreamErrorMessage(uploadInit) || `PostEverywhere 创建媒体上传失败，HTTP ${uploadInit.status}`);
+    }
+    const uploadData = publisherMediaData(uploadInit.data);
+    const mediaId = uploadData.media_id || uploadData.mediaId || uploadData.id;
+    if (!mediaId) {
+      throw new Error("PostEverywhere 没有返回 media_id。");
+    }
+    const uploadResult = await uploadBytesToPublisher(uploadData, source.bytes, contentType);
+    const complete = await proxyHttp({
+      provider: "posteverywhere",
+      mode: "http",
+      endpoint: publisherApiUrl(endpoint, `/media/${encodeURIComponent(mediaId)}/complete`),
+      apiKey,
+      body: {},
+    });
+    if (!complete.ok) {
+      throw new Error(upstreamErrorMessage(complete) || `PostEverywhere 完成媒体上传失败，HTTP ${complete.status}`);
+    }
+    const completeData = publisherMediaData(complete.data);
+    logProviderEvent({
+      kind: "publisher-media",
+      provider: "posteverywhere",
+      mode: "http",
+      endpoint: publisherApiUrl(endpoint, "/media/upload"),
+      phase: "response",
+      ok: true,
+      status: complete.status,
+      mediaId,
+      size: source.bytes.length,
+    });
+    sendJson(res, 200, {
+      ok: true,
+      mediaId,
+      upload: uploadData,
+      uploadResult,
+      complete: completeData,
+    });
+  } catch (error) {
+    const errorMessage = providerErrorMessage(error);
+    logProviderEvent({
+      kind: "publisher-media",
+      provider: "posteverywhere",
+      mode: "http",
+      endpoint,
+      phase: "error",
+      ok: false,
+      error: errorMessage,
+    });
+    sendJson(res, 400, { ok: false, error: errorMessage });
   }
 }
 
@@ -632,6 +886,7 @@ async function handleProvider(req, res, kind) {
       return;
     }
   } catch (error) {
+    const errorMessage = providerErrorMessage(error);
     logProviderEvent({
       kind,
       provider: providerRequest?.provider || "",
@@ -639,9 +894,9 @@ async function handleProvider(req, res, kind) {
       endpoint: providerRequest?.endpoint || "",
       phase: "error",
       ok: false,
-      error: error.message,
+      error: errorMessage,
     });
-    sendJson(res, 400, { ok: false, error: error.message });
+    sendJson(res, 400, { ok: false, error: errorMessage });
   }
 }
 
@@ -688,6 +943,7 @@ async function handleProviderStream(req, res, kind) {
     });
     res.end();
   } catch (error) {
+    const errorMessage = providerErrorMessage(error);
     logProviderEvent({
       kind,
       provider: providerRequest?.provider || "",
@@ -695,9 +951,9 @@ async function handleProviderStream(req, res, kind) {
       endpoint: providerRequest?.endpoint || "",
       phase: "stream-error",
       ok: false,
-      error: error.message,
+      error: errorMessage,
     });
-    writeStreamEvent(res, { type: "error", ok: false, error: error.message });
+    writeStreamEvent(res, { type: "error", ok: false, error: errorMessage });
     res.end();
   }
 }
@@ -751,6 +1007,10 @@ function createServer() {
     }
     if (req.method === "POST" && url.pathname === "/api/video/download") {
       handleVideoDownload(req, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/publisher/media-upload") {
+      handlePublisherMediaUpload(req, res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/provider/storyboard") {
