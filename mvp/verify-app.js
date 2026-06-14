@@ -15,9 +15,9 @@ assert.strictEqual(localConfig.integrations.llm.model, "gpt-5.5", "local startup
 assert.strictEqual(localConfig.integrations.llm.endpoint, "https://toapis.com/v1/chat/completions", "local startup config uses GPT-5.5 endpoint");
 assert.deepStrictEqual(JSON.parse(JSON.stringify(localConfig.selectedPlatforms)), ["tiktok"], "local startup config selects TikTok only");
 assert.ok(indexHtml.includes("app.js?v="), "index references app.js with a cache-busting version");
-assert.ok(indexHtml.includes("styles.css?v=20260614-product-image-label"), "index cache-busts product image label styles");
-assert.ok(indexHtml.includes("core.js?v=20260614-product-image-label"), "index cache-busts product image label core changes");
-assert.ok(indexHtml.includes("app.js?v=20260614-product-image-label"), "index cache-busts product image label app changes");
+assert.ok(indexHtml.includes("styles.css?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue styles");
+assert.ok(indexHtml.includes("core.js?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue core changes");
+assert.ok(indexHtml.includes("app.js?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue app changes");
 assert.ok(indexHtml.includes("local-config.js"), "index can load local ignored provider config before app startup");
 assert.ok(appJs.includes("loadReverseFrameData"), "app can inline extracted reverse frames for vision-capable LLMs");
 assert.ok(appJs.includes("openai-vision-chat"), "app documents the vision-capable LLM apiStyle for reverse reconstruction");
@@ -743,11 +743,11 @@ assert.ok(appHtml.includes('data-storyboard-script-text'), "create page storyboa
 sandbox.location.hash = "#dashboard";
 vm.runInContext("view = initialView(); renderShell();", sandbox);
 assert.ok(appHtml.includes("dashboard-queue-panel"), "dashboard renders the lightweight queue panel");
-assert.ok(appHtml.includes('data-dashboard-filter="storyboard"'), "dashboard stat cards expose storyboard filter controls");
+assert.ok(appHtml.includes('data-dashboard-filter="videoGenerate"'), "dashboard stat cards expose video generation filter controls");
 assert.ok(appHtml.includes('data-dashboard-filter="videoReview"'), "dashboard stat cards expose video review filter controls");
-assert.ok(appHtml.includes("<th>时间</th>"), "dashboard task table includes a time column");
-assert.ok(appHtml.includes("创建 "), "dashboard task rows show task creation time");
-assert.ok(appHtml.includes("更新 "), "dashboard task rows show task update time");
+assert.ok(appHtml.includes('data-dashboard-filter="archived"'), "dashboard exposes an archived task filter");
+assert.ok(appHtml.includes("dashboard-task-board"), "dashboard renders a card-based task board");
+assert.ok(!appHtml.includes("<table"), "dashboard no longer uses a dense table for tasks");
 assert.ok(appHtml.includes('data-dashboard-date-range="today"'), "dashboard exposes a today date range filter");
 assert.ok(appHtml.includes('data-dashboard-date-range="7d"'), "dashboard exposes a recent-days date range filter");
 assert.ok(appHtml.includes('data-dashboard-date-field="start"'), "dashboard exposes custom start date input");
@@ -762,6 +762,9 @@ vm.runInContext(`
       Object.assign({}, baseTask, {
         id: "task-storyboard",
         title: "分镜就绪任务",
+        productName: "台式即热饮水机",
+        variation: { hook: { text: "对象摘要不应该泄漏", detail: "对象字段应被格式化" }, angle: "厨房效率" },
+        favoriteName: "未使用收藏",
         status: "storyboard_ready",
         createdAt: yesterday,
         updatedAt: yesterday
@@ -769,7 +772,18 @@ vm.runInContext(`
       Object.assign({}, baseTask, {
         id: "task-video-review",
         title: "视频审核任务",
+        productName: "挂脖风扇",
+        variation: { hook: "夏日通勤降温" },
         status: "video_review",
+        createdAt: startToday,
+        updatedAt: startToday
+      }),
+      Object.assign({}, baseTask, {
+        id: "task-published",
+        title: "已发布任务",
+        productName: "净饮机",
+        variation: { hook: "发布完成" },
+        status: "published",
         createdAt: startToday,
         updatedAt: startToday
       })
@@ -792,10 +806,30 @@ vm.runInContext(`
 assert.ok(appHtml.includes("分镜就绪任务"), "recent-days dashboard date filter includes earlier tasks");
 assert.ok(appHtml.includes("视频审核任务"), "recent-days dashboard date filter keeps today's tasks");
 assert.ok(appHtml.includes("日期：近 7 天"), "dashboard list header names recent-days date range");
-assert.ok(appHtml.includes("task-title-block"), "dashboard task rows use a compact title block");
-assert.ok(appHtml.includes("task-meta-line"), "dashboard task rows keep duration and ratio in one metadata line");
-assert.ok(appHtml.includes("task-source-chip"), "dashboard source and strategy values are visually de-emphasized");
-assert.ok(appHtml.includes("task-actions"), "dashboard row actions are grouped in compact controls");
+assert.ok(appHtml.includes("dashboard-task-card"), "dashboard task rows are rendered as scannable cards");
+assert.ok(appHtml.includes("下一步：生成视频"), "dashboard cards expose a concrete next step");
+assert.ok(appHtml.includes("对象摘要不应该泄漏"), "dashboard formats object-shaped hook summaries");
+assert.ok(!appHtml.includes("[object Object]"), "dashboard never renders raw object values");
+assert.ok(appHtml.includes("dashboard-task-blockers"), "dashboard cards reserve space for blockers and readiness notes");
+vm.runInContext(`
+  dashboardDetailTaskId = "task-storyboard";
+  renderShell();
+`, sandbox);
+assert.ok(appHtml.includes("dashboard-task-drawer"), "dashboard opens a task detail drawer");
+assert.ok(appHtml.includes("任务详情"), "dashboard detail drawer has a clear title");
+assert.ok(appHtml.includes("台式即热饮水机"), "dashboard detail drawer shows the product context");
+vm.runInContext(`
+  handleAction({ action: "archive-task", taskId: "task-published" });
+  dashboardFilter = "all";
+  renderShell();
+`, sandbox);
+assert.ok(!appHtml.includes("已发布任务"), "archived completed tasks are hidden from the default dashboard");
+vm.runInContext(`
+  dashboardFilter = "archived";
+  renderShell();
+`, sandbox);
+assert.ok(appHtml.includes("已发布任务"), "archived filter shows archived completed tasks");
+assert.ok(appHtml.includes("恢复"), "archived task cards can be restored");
 
 sandbox.location.hash = "#favorites";
 vm.runInContext(`

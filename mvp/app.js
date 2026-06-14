@@ -9,6 +9,7 @@ let dashboardFilter = "all";
 let dashboardDateRange = "today";
 let dashboardCustomStart = "";
 let dashboardCustomEnd = "";
+let dashboardDetailTaskId = "";
 let storyboardEditorOpen = false;
 let storyboardEditorSceneIndex = 0;
 let copyDetailPlatformId = "";
@@ -154,19 +155,78 @@ function syncReviewFilterForTask(task) {
   reviewStatusFilter = reviewFilterIdForTask(task);
 }
 
-function dashboardFilterOptions(stats = Core.computeStats(state)) {
+function isTaskArchived(task) {
+  return Boolean(task && task.archivedAt);
+}
+
+function isCompletedTask(task) {
+  return ["published"].includes(task && task.status);
+}
+
+function dashboardTaskBlockers(task) {
+  const blockers = [];
+  const productName = displayText(task && task.productName).trim();
+  if (!productName || productName === "产品") blockers.push("缺产品名");
+  if (["copy_review", "ready_to_publish"].includes(task && task.status) && isMissingCopyReviewTask(task)) blockers.push("缺文案");
+  if (["copy_review", "ready_to_publish", "published"].includes(task && task.status) && !(task && task.video && task.video.url)) blockers.push("缺媒体");
+  if (task && task.status === "rejected") blockers.push(displayText(task.reviewNote) || "需要处理失败");
+  return blockers;
+}
+
+function dashboardTaskStage(task) {
+  if (isTaskArchived(task)) return { label: "已归档", detail: "默认隐藏" };
+  if (task.status === "content_plan_ready") return { label: "待生成分镜", detail: "内容规划" };
+  if (task.status === "storyboard_ready") return { label: "待生成视频", detail: "分镜已就绪" };
+  if (task.status === "video_generating") return { label: "视频生成中", detail: "等待查询结果" };
+  if (task.status === "video_review") return { label: "待视频审核", detail: "视频结果" };
+  if (task.status === "copy_review") return { label: isMissingCopyReviewTask(task) ? "待补文案" : "待文案审核", detail: "TikTok 文案" };
+  if (task.status === "ready_to_publish") return { label: "待发布", detail: "账号和内容" };
+  if (task.status === "published") return { label: "已发布", detail: "可归档" };
+  if (task.status === "rejected") return { label: "失败处理", detail: "需要恢复" };
+  return { label: Core.taskStatusLabel(task.status), detail: "任务状态" };
+}
+
+function dashboardNextAction(task) {
+  if (isTaskArchived(task)) return { label: "恢复", action: "restore-task", primary: false };
+  if (task.status === "content_plan_ready") return { label: "生成分镜", view: "create", primary: true };
+  if (task.status === "storyboard_ready" || task.status === "rejected") return { label: "生成视频", action: "generate-video", primary: true };
+  if (task.status === "video_generating") return { label: "查询结果", action: "refresh-video", primary: true };
+  if (task.status === "video_review") return { label: "审核视频", view: "review", primary: true };
+  if (task.status === "copy_review") return { label: isMissingCopyReviewTask(task) ? "补文案" : "审核文案", view: "publish", primary: true };
+  if (task.status === "ready_to_publish") return { label: "发布/定时", view: "publish", primary: true };
+  if (task.status === "published") return { label: "归档", action: "archive-task", primary: false };
+  return { label: "查看", view: "review", primary: false };
+}
+
+function dashboardTasksForFilterId(filterId, source = dashboardDateScopedTasks()) {
+  const tasks = Array.isArray(source) ? source : [];
+  if (filterId === "archived") return tasks.filter(isTaskArchived);
+  const activeTasks = tasks.filter((task) => !isTaskArchived(task));
+  if (filterId === "needsInput") return activeTasks.filter((task) => dashboardTaskBlockers(task).length > 0);
+  if (filterId === "videoGenerate") return activeTasks.filter((task) => ["content_plan_ready", "storyboard_ready", "rejected"].includes(task.status));
+  if (filterId === "videoReview") return activeTasks.filter((task) => task.status === "video_review" || task.status === "video_generating");
+  if (filterId === "copyReview") return activeTasks.filter((task) => task.status === "copy_review");
+  if (filterId === "ready") return activeTasks.filter((task) => task.status === "ready_to_publish");
+  if (filterId === "completed") return activeTasks.filter(isCompletedTask);
+  return activeTasks;
+}
+
+function dashboardFilterOptions(source = dashboardDateScopedTasks()) {
+  const tasks = Array.isArray(source) ? source : state.tasks;
   return [
-    { id: "all", label: "全部任务", count: stats.tasks, statuses: null },
-    { id: "storyboard", label: "分镜就绪", count: stats.storyboard, statuses: ["content_plan_ready", "storyboard_ready"] },
-    { id: "videoReview", label: "待视频审核", count: stats.videoReview, statuses: ["video_review"] },
-    { id: "copyReview", label: "待文案审核", count: stats.copyReview, statuses: ["copy_review"] },
-    { id: "ready", label: "待发布", count: stats.ready, statuses: ["ready_to_publish"] },
-    { id: "published", label: "已发布", count: stats.published, statuses: ["published"] },
+    { id: "all", label: "全部任务", count: dashboardTasksForFilterId("all", tasks).length },
+    { id: "needsInput", label: "待补信息", count: dashboardTasksForFilterId("needsInput", tasks).length },
+    { id: "videoGenerate", label: "待生成视频", count: dashboardTasksForFilterId("videoGenerate", tasks).length },
+    { id: "videoReview", label: "待视频审核", count: dashboardTasksForFilterId("videoReview", tasks).length },
+    { id: "copyReview", label: "待文案审核", count: dashboardTasksForFilterId("copyReview", tasks).length },
+    { id: "ready", label: "待发布", count: dashboardTasksForFilterId("ready", tasks).length },
+    { id: "completed", label: "已完成", count: dashboardTasksForFilterId("completed", tasks).length },
+    { id: "archived", label: "已归档", count: dashboardTasksForFilterId("archived", tasks).length },
   ];
 }
 
-function activeDashboardFilter(stats) {
-  return dashboardFilterOptions(stats).find((item) => item.id === dashboardFilter) || dashboardFilterOptions(stats)[0];
+function activeDashboardFilter(source = dashboardDateScopedTasks()) {
+  return dashboardFilterOptions(source).find((item) => item.id === dashboardFilter) || dashboardFilterOptions(source)[0];
 }
 
 function dashboardDateRangeOptions() {
@@ -236,9 +296,7 @@ function dashboardDateScopedTasks(source = state.tasks) {
 }
 
 function dashboardTasksForFilter(filter = activeDashboardFilter(), source = dashboardDateScopedTasks()) {
-  if (!filter.statuses) return source;
-  const statuses = new Set(filter.statuses);
-  return source.filter((task) => statuses.has(task.status));
+  return dashboardTasksForFilterId(filter.id, source);
 }
 
 function formatTaskDate(value) {
@@ -258,6 +316,131 @@ function taskTimeText(task) {
     created: formatTaskDate(task.createdAt),
     updated: formatTaskDate(task.updatedAt || task.createdAt),
   };
+}
+
+function shortText(value, maxLength = 84) {
+  const text = displayText(value).replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function taskProductName(task) {
+  const productName = displayText(task && task.productName).trim();
+  return productName || "产品";
+}
+
+function taskHookText(task) {
+  return displayText(task && task.variation && (task.variation.hook || task.variation.angle)) || displayText(task && task.strategySummary) || displayText(task && task.contentPlan && task.contentPlan.hook);
+}
+
+function taskCardTitle(task) {
+  const rawTitle = displayText(task && task.title).replace(/\s+/g, " ").trim();
+  const productName = taskProductName(task);
+  const hook = taskHookText(task);
+  if (rawTitle.length <= 90) return rawTitle || productName;
+  const composed = [productName !== "产品" ? productName : "", hook].filter(Boolean).join(" · ");
+  return shortText(composed || rawTitle, 90);
+}
+
+function taskCardSummary(task) {
+  return shortText(taskHookText(task) || displayText(task && task.favoriteName) || "未补充摘要", 96);
+}
+
+function renderDashboardActionButton(task, action) {
+  const className = `button compact ${action.primary ? "primary" : ""}`.trim();
+  if (action.view) {
+    return `<button class="${className}" data-select-task="${h(task.id)}" data-view="${h(action.view)}">继续处理</button>`;
+  }
+  return `<button class="${className}" data-action="${h(action.action)}" data-task-id="${h(task.id)}">${h(action.label)}</button>`;
+}
+
+function renderDashboardTaskCard(task) {
+  const taskTime = taskTimeText(task);
+  const stage = dashboardTaskStage(task);
+  const nextAction = dashboardNextAction(task);
+  const blockers = dashboardTaskBlockers(task);
+  const source = displayText(task.favoriteName) || "未使用收藏";
+  const strategy = Core.strategyLabel(task.strategy);
+  const selected = selectedTaskIds.has(task.id);
+  return `
+    <article class="dashboard-task-card ${selected ? "selected" : ""} ${isTaskArchived(task) ? "archived" : ""}" data-dashboard-task-card="${h(task.id)}">
+      <div class="dashboard-task-check">
+        <input type="checkbox" data-batch-task-id="${h(task.id)}" ${selected ? "checked" : ""} />
+      </div>
+      <div class="dashboard-task-main">
+        <div class="dashboard-task-title-row">
+          <span class="status ${statusClass(task.status)}">${h(stage.label)}</span>
+          <strong title="${h(displayText(task.title))}">${h(taskCardTitle(task))}</strong>
+        </div>
+        <p class="dashboard-task-summary" title="${h(taskCardSummary(task))}">${h(taskCardSummary(task))}</p>
+        <div class="dashboard-task-meta">
+          <span>${h(taskProductName(task))}</span>
+          <span>${h(source)}</span>
+          <span>${h(strategy)}</span>
+          <span>${h(task.duration || 15)}s / ${h(task.ratio || "9:16")}</span>
+          <span>创建 ${h(taskTime.created)}</span>
+          <span>更新 ${h(taskTime.updated)}</span>
+        </div>
+        <div class="dashboard-task-blockers">
+          ${blockers.length ? blockers.map((item) => `<span class="status warning">${h(item)}</span>`).join("") : `<span class="tag">${h(stage.detail)}</span>`}
+        </div>
+      </div>
+      <div class="dashboard-task-next">
+        <span>下一步：${h(nextAction.label)}</span>
+        <div class="actions">
+          ${renderDashboardActionButton(task, nextAction)}
+          <button class="button compact" data-action="open-dashboard-task" data-task-id="${h(task.id)}">查看</button>
+          ${isTaskArchived(task)
+            ? `<button class="button compact" data-action="restore-task" data-task-id="${h(task.id)}">恢复</button>`
+            : isCompletedTask(task) ? `<button class="button compact" data-action="archive-task" data-task-id="${h(task.id)}">归档</button>` : ""}
+          <button class="button compact danger ghost-danger" data-action="delete-task" data-task-id="${h(task.id)}">删除</button>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function renderDashboardDetailDrawer(task) {
+  if (!task) return "";
+  const stage = dashboardTaskStage(task);
+  const blockers = dashboardTaskBlockers(task);
+  const taskTime = taskTimeText(task);
+  const contentPlan = task.contentPlan && typeof task.contentPlan === "object" ? task.contentPlan : {};
+  const sellingPoints = listText(contentPlan.keySellingPoints || task.contentBrief?.proofPoints || []);
+  return `
+    <aside class="dashboard-task-drawer">
+      <div class="drawer-head">
+        <div>
+          <span class="tag">任务详情</span>
+          <h2>${h(taskCardTitle(task))}</h2>
+        </div>
+        <button class="icon-button" data-action="close-dashboard-task" aria-label="关闭任务详情">×</button>
+      </div>
+      <div class="drawer-section">
+        <dl class="detail-list">
+          <div><dt>阶段</dt><dd>${h(stage.label)} · ${h(stage.detail)}</dd></div>
+          <div><dt>产品</dt><dd>${h(taskProductName(task))}</dd></div>
+          <div><dt>来源</dt><dd>${h(displayText(task.favoriteName) || "未使用收藏")}</dd></div>
+          <div><dt>生成方式</dt><dd>${h(Core.strategyLabel(task.strategy))}</dd></div>
+          <div><dt>时间</dt><dd>创建 ${h(taskTime.created)}；更新 ${h(taskTime.updated)}</dd></div>
+          <div><dt>规格</dt><dd>${h(task.duration || 15)}s / ${h(task.ratio || "9:16")} / ${h(task.videoResolution || "720p")}</dd></div>
+        </dl>
+      </div>
+      <div class="drawer-section">
+        <h3>下一步</h3>
+        <p>${h(dashboardNextAction(task).label)}</p>
+        ${blockers.length ? `<div class="dashboard-task-blockers">${blockers.map((item) => `<span class="status warning">${h(item)}</span>`).join("")}</div>` : ""}
+      </div>
+      <div class="drawer-section">
+        <h3>内容摘要</h3>
+        <p>${h(taskCardSummary(task))}</p>
+        ${sellingPoints ? `<p class="muted">卖点：${h(sellingPoints)}</p>` : ""}
+      </div>
+      <div class="drawer-section">
+        <h3>完整标题</h3>
+        <p>${h(displayText(task.title) || "未命名任务")}</p>
+      </div>
+    </aside>
+  `;
 }
 
 function h(text) {
@@ -1043,9 +1226,8 @@ function renderView() {
 function renderDashboard() {
   pruneSelectedTasks();
   const dateScopedTasks = dashboardDateScopedTasks();
-  const stats = Core.computeStats(Object.assign({}, state, { tasks: dateScopedTasks }));
-  const filterOptions = dashboardFilterOptions(stats);
-  const filter = activeDashboardFilter(stats);
+  const filterOptions = dashboardFilterOptions(dateScopedTasks);
+  const filter = activeDashboardFilter(dateScopedTasks);
   const visibleTasks = dashboardTasksForFilter(filter, dateScopedTasks);
   const selected = selectedTasks(visibleTasks);
   const selectedCount = selected.length;
@@ -1054,6 +1236,7 @@ function renderDashboard() {
   const allSelected = visibleTasks.length > 0 && selectedCount === visibleTasks.length;
   const customStart = dashboardCustomStart || dateInputValue();
   const customEnd = dashboardCustomEnd || dateInputValue();
+  const detailTask = dashboardDetailTaskId ? state.tasks.find((item) => item.id === dashboardDetailTaskId) : null;
   return `
     <section>
       <div class="section-head">
@@ -1098,41 +1281,18 @@ function renderDashboard() {
             </div>
           </div>
         ` : ""}
-        <table class="task-table queue-table">
-          <thead><tr><th class="select-col"><input type="checkbox" data-batch-select-all ${allSelected ? "checked" : ""} ${visibleTasks.length ? "" : "disabled"} /></th><th>任务</th><th>时间</th><th>内容来源</th><th>生成方式</th><th>状态</th><th>负责人</th><th>操作</th></tr></thead>
-          <tbody>
-            ${visibleTasks.length ? visibleTasks.map(task => {
-              const taskTime = taskTimeText(task);
-              return `
-              <tr>
-                <td><input type="checkbox" data-batch-task-id="${task.id}" ${selectedTaskIds.has(task.id) ? "checked" : ""} /></td>
-                <td>
-                  <div class="task-title-block">
-                    <strong class="task-title" title="${h(task.title)}">${h(task.title)}</strong>
-                    <p class="task-summary muted" title="${h(task.variation.hook)}">${h(task.variation.hook)}</p>
-                    <p class="task-meta-line"><span>${task.duration}s</span><span>${h(task.ratio)}</span></p>
-                  </div>
-                </td>
-                <td>
-                  <div class="task-time-block">
-                    <span>创建 ${h(taskTime.created)}</span>
-                    <span>更新 ${h(taskTime.updated)}</span>
-                  </div>
-                </td>
-                <td><span class="task-source-chip" title="${h(task.favoriteName)}">${h(task.favoriteName)}</span></td>
-                <td><span class="task-source-chip strategy-chip" title="${h(Core.strategyLabel(task.strategy))}">${h(Core.strategyLabel(task.strategy))}</span></td>
-                <td><span class="status ${statusClass(task.status)}">${Core.taskStatusLabel(task.status)}</span></td>
-                <td><span class="task-owner">${h(task.owner)}</span></td>
-                <td>
-                  <div class="actions task-actions">
-                    <button class="button compact" data-select-task="${task.id}" data-view="${task.status === "published" ? "publish" : "review"}">查看</button>
-                    <button class="button compact danger ghost-danger" data-action="delete-task" data-task-id="${task.id}">删除</button>
-                  </div>
-                </td>
-              </tr>
-            `}).join("") : `<tr><td colspan="8"><p class="muted">${state.tasks.length ? "当前筛选下没有任务。" : "还没有任务。先输入产品想法和产品图，生成一条真实内容规划。"}</p></td></tr>`}
-          </tbody>
-        </table>
+        <div class="dashboard-task-select-row">
+          <label><input type="checkbox" data-batch-select-all ${allSelected ? "checked" : ""} ${visibleTasks.length ? "" : "disabled"} /> 全选当前队列</label>
+          <span>${visibleTasks.length ? `当前队列 ${visibleTasks.length} 条` : "当前筛选下没有任务"}</span>
+        </div>
+        <div class="dashboard-task-layout ${detailTask ? "has-detail" : ""}">
+          <div class="dashboard-task-board">
+            ${visibleTasks.length
+              ? visibleTasks.map(renderDashboardTaskCard).join("")
+              : `<div class="empty-list"><strong>${state.tasks.length ? "当前筛选下没有任务。" : "还没有任务。"}</strong><p class="muted">${state.tasks.length ? "换一个时间范围或队列查看。" : "先输入产品想法和产品图，生成一条真实内容规划。"}</p></div>`}
+          </div>
+          ${renderDashboardDetailDrawer(detailTask)}
+        </div>
       </div>
     </section>
   `;
@@ -3493,6 +3653,51 @@ async function handleAction(dataset) {
   if (action === "close-copy-detail") {
     copyDetailPlatformId = "";
     renderShell();
+    return;
+  }
+  if (action === "open-dashboard-task") {
+    const target = state.tasks.find((item) => item.id === taskId);
+    if (!target) {
+      toast("任务不存在或已被删除。");
+      return;
+    }
+    dashboardDetailTaskId = target.id;
+    state.selectedTaskId = target.id;
+    renderShell();
+    return;
+  }
+  if (action === "close-dashboard-task") {
+    dashboardDetailTaskId = "";
+    renderShell();
+    return;
+  }
+  if (action === "archive-task") {
+    const target = state.tasks.find((item) => item.id === taskId);
+    if (!target) {
+      toast("任务不存在或已被删除。");
+      return;
+    }
+    target.archivedAt = new Date().toISOString();
+    target.updatedAt = target.archivedAt;
+    selectedTaskIds.delete(target.id);
+    if (dashboardDetailTaskId === target.id) dashboardDetailTaskId = "";
+    saveState();
+    renderShell();
+    toast("任务已归档，默认列表不再显示。");
+    return;
+  }
+  if (action === "restore-task") {
+    const target = state.tasks.find((item) => item.id === taskId);
+    if (!target) {
+      toast("任务不存在或已被删除。");
+      return;
+    }
+    delete target.archivedAt;
+    target.updatedAt = new Date().toISOString();
+    dashboardDetailTaskId = target.id;
+    saveState();
+    renderShell();
+    toast("任务已恢复到看板。");
     return;
   }
   if (action === "delete-task") {
