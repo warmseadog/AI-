@@ -471,7 +471,12 @@
   }
 
   function productDisplayName(product) {
-    return String(product && (product.name || product.imageLabel) || "").trim() || "产品";
+    return String(product && product.name || "").trim() || "产品";
+  }
+
+  function productMaterialLabel(product) {
+    const name = String(product && product.name || "").trim();
+    return name ? `${name} 产品图` : "上传产品图";
   }
 
   function productAiContext(product) {
@@ -496,7 +501,7 @@
     if (imageData) {
       materials.push({
         type: "upload",
-        label: product.imageLabel || product.name || "上传图片",
+        label: productMaterialLabel(product),
         dataUrl: imageData,
       });
     }
@@ -1479,7 +1484,7 @@
 
   function productVisualIdentityPrompt(product, productName) {
     const hasReferenceImage = Boolean(product && String(product.imageUrl || product.imageData || "").trim());
-    const nameText = [productName, product && product.name, product && product.imageLabel].filter(Boolean).join(" ");
+    const nameText = [productName, product && product.name].filter(Boolean).join(" ");
     const genericLock = [
       "产品参考图为最高优先级：视频中的产品必须严格匹配所选产品参考图。",
       "不得改变产品颜色、外观轮廓、比例、材质和关键结构；不得改成同类但不同款产品；不得自动美化成其他品牌或其他型号。",

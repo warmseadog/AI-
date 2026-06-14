@@ -4,7 +4,7 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const ROOT = __dirname;
-const OUTPUTS_ROOT = path.join(ROOT, "..", "outputs");
+const OUTPUTS_ROOT = path.resolve(process.env.AI_VIDEO_OUTPUTS_ROOT || path.join(ROOT, "..", "outputs"));
 const PORT = Number(process.env.PORT || 4188);
 
 const types = {
@@ -100,6 +100,77 @@ function providerErrorMessage(error) {
     cause && cause.message && cause.message !== message ? cause.message : "",
   ].filter(Boolean);
   return causeParts.length ? `${message} (${causeParts.join(": ")})` : message;
+}
+
+const LLM_RETRY_ATTEMPTS = 3;
+const LLM_RETRY_DELAYS_MS = [250, 750];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLlmRequest(providerRequest) {
+  const body = providerRequest && providerRequest.body || {};
+  return Array.isArray(body.messages) || Array.isArray(body.input);
+}
+
+function shouldRetryProviderKind(kind, providerRequest) {
+  return isLlmRequest(providerRequest) || ["brief", "content-plan", "storyboard", "reverse-storyboard", "copy"].includes(kind);
+}
+
+function retryDelayMs(attempt) {
+  return LLM_RETRY_DELAYS_MS[Math.min(attempt - 1, LLM_RETRY_DELAYS_MS.length - 1)] || 0;
+}
+
+function retryableStatus(status) {
+  return [408, 429, 500, 502, 503, 504, 524].includes(Number(status));
+}
+
+function retryableError(error) {
+  const text = providerErrorMessage(error).toLowerCase();
+  return /fetch failed|econnreset|etimedout|econnrefused|enotfound|network|socket|timeout|dns|getaddrinfo|temporar/.test(text);
+}
+
+function retryableProxyFailure(proxied) {
+  if (!proxied || proxied.ok) return false;
+  if (retryableStatus(proxied.status)) return true;
+  const message = upstreamErrorMessage(proxied);
+  return /没有返回内容|empty|暂时|重试|retry|rate.?limit|timeout|超时|temporar/i.test(message);
+}
+
+function retryAwareFailureMessage(proxied) {
+  const base = upstreamErrorMessage(proxied) || `upstream HTTP ${proxied && proxied.status}`;
+  return proxied && proxied.attempts > 1 ? `已尝试 ${proxied.attempts} 次，最后一次错误：${base}` : base;
+}
+
+async function proxyHttpWithRetry(providerRequest, options = {}) {
+  const maxAttempts = options.maxAttempts || LLM_RETRY_ATTEMPTS;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const proxied = await proxyHttp(providerRequest);
+      const result = { ...proxied, attempts: attempt };
+      if (result.ok || !retryableProxyFailure(result) || attempt === maxAttempts) {
+        return result;
+      }
+      if (typeof options.onRetry === "function") {
+        options.onRetry({ attempt, nextAttempt: attempt + 1, status: result.status, error: upstreamErrorMessage(result) || "" });
+      }
+    } catch (error) {
+      lastError = error;
+      if (!retryableError(error) || attempt === maxAttempts) {
+        const message = attempt > 1 ? `已尝试 ${attempt} 次，最后一次错误：${providerErrorMessage(error)}` : providerErrorMessage(error);
+        const retryError = new Error(message);
+        retryError.cause = error;
+        throw retryError;
+      }
+      if (typeof options.onRetry === "function") {
+        options.onRetry({ attempt, nextAttempt: attempt + 1, error: providerErrorMessage(error) });
+      }
+    }
+    await sleep(retryDelayMs(attempt));
+  }
+  throw lastError || new Error("provider retry failed");
 }
 
 async function proxyHttp(providerRequest) {
@@ -254,6 +325,22 @@ async function proxyHttpStream(providerRequest, onEvent) {
   const decoder = new TextDecoder();
   let text = "";
   let streamedText = "";
+  let emittedChunk = false;
+  const emitChunk = (chunk) => {
+    if (!chunk) return;
+    emittedChunk = true;
+    onEvent({ type: "chunk", text: chunk });
+  };
+  if (!response.ok) {
+    text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+    return { status: response.status, ok: false, data, emittedChunk };
+  }
   if (contentType.includes("text/event-stream") && response.body && response.body.getReader) {
     const reader = response.body.getReader();
     let buffer = "";
@@ -268,7 +355,7 @@ async function proxyHttpStream(providerRequest, onEvent) {
         const deltaText = streamTextFromSsePayload(parsed);
         if (deltaText) {
           streamedText += deltaText;
-          onEvent({ type: "chunk", text: deltaText });
+          emitChunk(deltaText);
         }
       } catch {
         // Ignore non-JSON SSE housekeeping lines.
@@ -292,16 +379,16 @@ async function proxyHttpStream(providerRequest, onEvent) {
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
       text += chunk;
-      onEvent({ type: "chunk", text: chunk });
+      emitChunk(chunk);
     }
     const tail = decoder.decode();
     if (tail) {
       text += tail;
-      onEvent({ type: "chunk", text: tail });
+      emitChunk(tail);
     }
   } else {
     text = await response.text();
-    onEvent({ type: "chunk", text });
+    emitChunk(text);
   }
   let data;
   if (streamedText) {
@@ -315,7 +402,37 @@ async function proxyHttpStream(providerRequest, onEvent) {
   }
   const proxied = { status: response.status, ok: response.ok, data };
   const embeddedError = embeddedUpstreamErrorMessage(proxied);
-  return { status: response.status, ok: response.ok && !embeddedError, data };
+  return { status: response.status, ok: response.ok && !embeddedError, data, emittedChunk };
+}
+
+async function proxyHttpStreamWithRetry(providerRequest, onEvent, options = {}) {
+  const maxAttempts = options.maxAttempts || LLM_RETRY_ATTEMPTS;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const proxied = await proxyHttpStream(providerRequest, onEvent);
+      const result = { ...proxied, attempts: attempt };
+      if (result.ok || result.emittedChunk || !retryableProxyFailure(result) || attempt === maxAttempts) {
+        return result;
+      }
+      if (typeof options.onRetry === "function") {
+        options.onRetry({ attempt, nextAttempt: attempt + 1, status: result.status, error: upstreamErrorMessage(result) || "" });
+      }
+    } catch (error) {
+      lastError = error;
+      if (!retryableError(error) || attempt === maxAttempts) {
+        const message = attempt > 1 ? `已尝试 ${attempt} 次，最后一次错误：${providerErrorMessage(error)}` : providerErrorMessage(error);
+        const retryError = new Error(message);
+        retryError.cause = error;
+        throw retryError;
+      }
+      if (typeof options.onRetry === "function") {
+        options.onRetry({ attempt, nextAttempt: attempt + 1, error: providerErrorMessage(error) });
+      }
+    }
+    await sleep(retryDelayMs(attempt));
+  }
+  throw lastError || new Error("provider stream retry failed");
 }
 
 function redactProxyData(data) {
@@ -652,8 +769,12 @@ async function handleVideoUpload(req, res, url) {
   }
 }
 
+function ffmpegCommand() {
+  return process.env.AI_VIDEO_FFMPEG_PATH || "ffmpeg";
+}
+
 function ffmpegAvailable() {
-  const result = spawnSync("ffmpeg", ["-version"], { encoding: "utf8" });
+  const result = spawnSync(ffmpegCommand(), ["-version"], { encoding: "utf8" });
   return !result.error && result.status === 0;
 }
 
@@ -672,7 +793,7 @@ async function handleVideoFrames(req, res) {
     const frameDir = path.join(OUTPUTS_ROOT, "uploads", uploadId || path.basename(path.dirname(sourcePath)), "frames");
     fs.mkdirSync(frameDir, { recursive: true });
     const pattern = path.join(frameDir, "frame-%03d.jpg");
-    const result = spawnSync("ffmpeg", [
+    const result = spawnSync(ffmpegCommand(), [
       "-y",
       "-i", sourcePath,
       "-vf", `fps=${frameCount}/15,scale=720:-1`,
@@ -751,6 +872,28 @@ function buildTestRequest(config) {
   return null;
 }
 
+function supportsReverseVisionConfig(config) {
+  const apiStyle = String(config && config.apiStyle || "");
+  if (/vision|multimodal/i.test(apiStyle)) return true;
+  const model = String(config && config.model || "").trim().toLowerCase();
+  return /^gpt-(?:5(?:\.5)?|4o|4\.1|4\.5)(?:$|[-_.])/.test(model);
+}
+
+function llmTestCapabilities(config) {
+  return {
+    reverseStoryboard: supportsReverseVisionConfig(config),
+  };
+}
+
+function llmTestWarnings(config, capabilities) {
+  const warnings = [];
+  if (capabilities && capabilities.reverseStoryboard === false) {
+    const modelName = config && config.provider === "deepseek" ? "DeepSeek 文本模型" : "当前文本模型";
+    warnings.push(`注意：当前模型反推不可用。${modelName}不能读取关键帧图片；内容规划、分镜和文案仍可用。如需反推，请切换支持图片输入的视觉模型，或把 apiStyle 设为 openai-vision-chat / multimodal。`);
+  }
+  return warnings;
+}
+
 async function handleTestConnection(req, res) {
   try {
     const payload = await readBody(req);
@@ -782,14 +925,18 @@ async function handleTestConnection(req, res) {
       sendJson(res, 200, { ok: true, mode: config.mode, provider: config.provider, checkedAt: new Date().toISOString(), message: "配置已通过基础检查。" });
       return;
     }
-    const proxied = await proxyHttp(providerRequest);
+    const proxied = config.kind === "llm" ? await proxyHttpWithRetry(providerRequest) : await proxyHttp(providerRequest);
+    const capabilities = config.kind === "llm" ? llmTestCapabilities(config) : undefined;
+    const warnings = config.kind === "llm" && proxied.ok ? llmTestWarnings(config, capabilities) : [];
     sendJson(res, proxied.ok ? 200 : 502, {
       ok: proxied.ok,
       mode: "http",
       provider: config.provider,
       checkedAt: new Date().toISOString(),
-      message: proxied.ok ? "真实接口连接成功。" : `真实接口连接失败，HTTP ${proxied.status}`,
-      upstream: { status: proxied.status, data: redactProxyData(proxied.data) },
+      message: proxied.ok ? "真实接口连接成功。" : `真实接口连接失败，${proxied.attempts > 1 ? `已尝试 ${proxied.attempts} 次，` : ""}HTTP ${proxied.status}`,
+      warnings,
+      capabilities,
+      upstream: { status: proxied.status, attempts: proxied.attempts || 1, data: redactProxyData(proxied.data) },
     });
   } catch (error) {
     sendJson(res, 400, { ok: false, checkedAt: new Date().toISOString(), error: error.message });
@@ -868,19 +1015,30 @@ async function handleProvider(req, res, kind) {
       throw new Error("non-http provider mode has been removed; configure a real HTTP provider.");
     }
     if (providerRequest.mode === "http") {
-      const proxied = await proxyHttp(providerRequest);
+      const useRetry = shouldRetryProviderKind(kind, providerRequest);
+      const proxied = useRetry ? await proxyHttpWithRetry(providerRequest, {
+        onRetry: (retry) => logProviderEvent({
+          ...baseEvent,
+          phase: "retry",
+          attempt: retry.attempt,
+          nextAttempt: retry.nextAttempt,
+          status: retry.status,
+          error: retry.error,
+        }),
+      }) : await proxyHttp(providerRequest);
       logProviderEvent({
         ...baseEvent,
         phase: "response",
         ok: proxied.ok,
         status: proxied.status,
+        attempts: proxied.attempts || 1,
         data: redactProxyData(proxied.data),
       });
       sendJson(res, proxied.ok ? 200 : 502, {
         ok: proxied.ok,
         mode: "http",
         provider: providerRequest.provider,
-        error: proxied.ok ? undefined : upstreamErrorMessage(proxied) || `upstream HTTP ${proxied.status}`,
+        error: proxied.ok ? undefined : retryAwareFailureMessage(proxied),
         upstream: proxied,
       });
       return;
@@ -927,18 +1085,29 @@ async function handleProviderStream(req, res, kind) {
     if (providerRequest.mode !== "http") {
       throw new Error("non-http provider mode has been removed; configure a real HTTP provider.");
     }
-    const proxied = await proxyHttpStream(providerRequest, (event) => writeStreamEvent(res, event));
+    const useRetry = shouldRetryProviderKind(kind, providerRequest);
+    const proxied = useRetry ? await proxyHttpStreamWithRetry(providerRequest, (event) => writeStreamEvent(res, event), {
+      onRetry: (retry) => logProviderEvent({
+        ...baseEvent,
+        phase: "stream-retry",
+        attempt: retry.attempt,
+        nextAttempt: retry.nextAttempt,
+        status: retry.status,
+        error: retry.error,
+      }),
+    }) : await proxyHttpStream(providerRequest, (event) => writeStreamEvent(res, event));
     logProviderEvent({
       ...baseEvent,
       phase: "stream-response",
       ok: proxied.ok,
       status: proxied.status,
+      attempts: proxied.attempts || 1,
       data: redactProxyData(proxied.data),
     });
     writeStreamEvent(res, {
       type: "done",
       ok: proxied.ok,
-      error: proxied.ok ? "" : upstreamErrorMessage(proxied) || `upstream HTTP ${proxied.status}`,
+      error: proxied.ok ? "" : retryAwareFailureMessage(proxied),
       upstream: proxied,
     });
     res.end();
@@ -1063,4 +1232,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer };
+module.exports = { createServer, ffmpegCommand };

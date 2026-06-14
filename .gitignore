@@ -9,4 +9,7 @@ node_modules/
 
 .playwright-cli/
 outputs/
+dist/
+resources/bin/ffmpeg.exe
+resources/bin/ffmpeg
 *.log

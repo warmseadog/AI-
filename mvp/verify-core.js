@@ -203,7 +203,7 @@ const created = Core.createContentPlanTask(state, {
   providerResponse: { ok: true },
 });
 assert.strictEqual(created.status, "content_plan_ready", "created task waits for content plan review");
-assert.strictEqual(created.productName, "产品图", "blank product name falls back to generic product image label");
+assert.strictEqual(created.productName, "产品", "blank product name falls back to generic product name");
 assert.deepStrictEqual(created.storyboard, [], "content planning does not prefill storyboard scenes");
 assert.strictEqual(created.storyboardTimingStatus, "not_started", "content plan task records that storyboard generation has not started");
 assert.strictEqual(state.tasks[0].id, created.id, "created content plan task is persisted");
@@ -224,6 +224,66 @@ const objectListTask = Core.createContentPlanTask(objectListState, {
 assert.ok(!objectListTask.contentPlan.keySellingPoints.includes("[object Object]"), "object-shaped plan list items are not stringified as [object Object]");
 assert.ok(objectListTask.contentPlan.keySellingPoints[0].includes("Hands-free"), "object-shaped selling points keep readable object content");
 assert.ok(objectListTask.contentPlan.painPoints[0].includes("夏天排队太热"), "object-shaped pain points keep readable object content");
+
+const randomImageNameState = Core.createInitialState();
+const randomImageProduct = randomImageNameState.products[0];
+randomImageProduct.imageData = "data:image/png;base64,AAA";
+randomImageProduct.imageLabel = "IMG_8F3A92C7";
+randomImageNameState.contentBrief.seed = "我想做一条净饮机短视频，突出厨房场景。";
+const randomImagePlanRequest = Core.buildContentPlanProviderRequest(randomImageNameState);
+const randomImagePlanPayload = userMessagePayload(randomImagePlanRequest);
+const randomImageNeedle = "IMG_8F3A92C7";
+assert.strictEqual(randomImagePlanPayload.materials[0].label, "上传产品图", "uploaded image material uses a generic label when product name is blank");
+assert.ok(!JSON.stringify(randomImagePlanRequest).includes(randomImageNeedle), "content plan request does not leak random image filenames");
+const randomImageTask = Core.createContentPlanTask(randomImageNameState, {
+  contentPlan: {
+    productUnderstanding: "台面净饮机，适合厨房和办公室。",
+    targetAudience: "家庭用户。",
+    keySellingPoints: ["免安装", "即热"],
+    usageScenarios: ["厨房", "办公室"],
+    strategy: "痛点解决",
+    hook: "Tired of boiling water?",
+    reviewSummary: "避免夸大净化效果。",
+    complianceNotes: ["不承诺医疗功效"],
+    scenes: [],
+  },
+});
+assert.strictEqual(randomImageTask.productName, "产品", "blank product name falls back to generic product name, not image filename");
+assert.ok(!randomImageTask.title.includes(randomImageNeedle), "task title does not include random image filename");
+randomImageTask.storyboard = Core.normalizeStoryboardTiming([
+  {
+    time: "0-3s",
+    title: "厨房痛点",
+    visual: "用户在厨房等待热水，随后展示产品。",
+    subtitle: "Still boiling water?",
+    camera: "9:16 close-up",
+    motion: "quick reveal",
+    videoPrompt: "vertical video, product reveal in a kitchen",
+  },
+], 15);
+randomImageTask.storyboardTimingStatus = randomImageTask.storyboard.timingStatus;
+const randomImageVideoRequest = Core.buildVideoProviderRequest(randomImageNameState, randomImageTask, randomImageProduct);
+assert.ok(!JSON.stringify(randomImageVideoRequest.body).includes(randomImageNeedle), "video provider request does not leak random image filenames");
+assert.ok(JSON.stringify(randomImageVideoRequest.body).includes("生成产品：产品"), "video provider request uses a generic product name when no explicit name is set");
+randomImageNameState.integrations.publisher.accountIds = "2280";
+randomImageNameState.integrations.publisher.apiKey = "publisher-key";
+randomImageTask.video = { url: "https://example.test/generated.mp4" };
+randomImageTask.copies = {
+  tiktok: {
+    platformId: "tiktok",
+    platformName: "TikTok",
+    title: "Water check",
+    body: "No more waiting for hot water.",
+    cta: "Would you use this?",
+    hashtags: ["Kitchen"],
+    approved: true,
+  },
+};
+const randomImageScheduledPost = Core.createScheduledPost(randomImageNameState, randomImageTask, "tiktok", {
+  scheduledAt: "2026-06-12T09:30",
+  timezone: "Asia/Shanghai",
+});
+assert.strictEqual(randomImageScheduledPost.productName, "产品", "scheduled post snapshot does not store random image filename as product name");
 
 created.contentPlan.strategy = "用户手动改过的内容规划：先讲办公室热浪，再展示挂脖风扇。";
 created.contentPlan.storyboardGuidance = "每个镜头都必须围绕办公室通勤和产品佩戴展开。";

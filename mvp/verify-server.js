@@ -2,7 +2,7 @@ const assert = require("assert");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
-const { createServer } = require("./server.js");
+const { createServer, ffmpegCommand } = require("./server.js");
 const Core = require("./core.js");
 
 async function request(baseUrl, path, body, options = {}) {
@@ -53,6 +53,13 @@ async function requestText(baseUrl, path, body, options = {}) {
 }
 
 async function main() {
+  const originalFfmpegPath = process.env.AI_VIDEO_FFMPEG_PATH;
+  process.env.AI_VIDEO_FFMPEG_PATH = "/tmp/custom-ffmpeg";
+  assert.strictEqual(ffmpegCommand(), "/tmp/custom-ffmpeg", "server honors AI_VIDEO_FFMPEG_PATH for desktop bundles");
+  delete process.env.AI_VIDEO_FFMPEG_PATH;
+  assert.strictEqual(ffmpegCommand(), "ffmpeg", "server falls back to PATH ffmpeg");
+  if (originalFfmpegPath) process.env.AI_VIDEO_FFMPEG_PATH = originalFfmpegPath;
+
   const outputFixtureDir = path.join(__dirname, "..", "outputs");
   const outputFixturePath = path.join(outputFixtureDir, "verify-static-video.mp4");
   const providerEventsPath = path.join(outputFixtureDir, "provider-events.jsonl");
@@ -64,9 +71,75 @@ async function main() {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const upstreamCalls = [];
+  let flakyCompletionsAttempts = 0;
+  let flakyStreamAttempts = 0;
   const upstream = http.createServer((req, res) => {
     const call = { method: req.method, url: req.url, body: "" };
     upstreamCalls.push(call);
+    if (req.url === "/chat/flaky-completions" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        flakyCompletionsAttempts += 1;
+        if (flakyCompletionsAttempts < 3) {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: `temporary upstream failure ${flakyCompletionsAttempts}` } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  contentPlan: {
+                    productUnderstanding: "重试后返回的内容规划。",
+                    targetAudience: "TikTok 美国用户。",
+                    keySellingPoints: ["retry recovered"],
+                    usageScenarios: ["outdoor"],
+                    strategy: "先失败两次，第三次恢复。",
+                    hook: "Retry works.",
+                    reviewSummary: "重试恢复后可继续处理。",
+                    complianceNotes: ["不要重复创建任务"],
+                  },
+                }),
+              },
+            },
+          ],
+        }));
+      });
+      return;
+    }
+    if (req.url === "/chat/flaky-stream" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        flakyStreamAttempts += 1;
+        if (flakyStreamAttempts < 3) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: `temporary stream failure ${flakyStreamAttempts}` } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "{\"contentPlan\":" } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "{\"productUnderstanding\":\"stream retry\",\"targetAudience\":\"US users\",\"keySellingPoints\":[\"stream recovered\"],\"strategy\":\"retry\",\"hook\":\"Recovered\"}}" } }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      });
+      return;
+    }
+    if (req.url === "/chat/auth-failure" && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk;
+      });
+      req.on("end", () => {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "invalid api key" } }));
+      });
+      return;
+    }
     if (req.url === "/videos/generated.mp4") {
       res.writeHead(200, { "content-type": "video/mp4" });
       res.end(Buffer.from("downloaded-video"));
@@ -252,6 +325,13 @@ async function main() {
     assert.ok(created, "content plan provider response creates a task");
     assert.strictEqual(created.status, "content_plan_ready", "created task enters content plan review");
 
+    const retriedContentPlan = await request(baseUrl, "/api/provider/content-plan", {
+      providerRequest: Object.assign({}, contentPlanRequest, { endpoint: `${upstreamBaseUrl}/chat/flaky-completions` }),
+    });
+    assert.strictEqual(retriedContentPlan.ok, true, "non-stream LLM proxy succeeds after transient upstream failures");
+    assert.strictEqual(flakyCompletionsAttempts, 3, "non-stream LLM proxy retries transient failures up to three total attempts");
+    assert.strictEqual(retriedContentPlan.upstream.attempts, 3, "non-stream retry count is returned to the caller");
+
     const streamedContentPlan = await requestText(baseUrl, "/api/provider/content-plan-stream", {
       providerRequest: contentPlanRequest,
     });
@@ -275,6 +355,15 @@ async function main() {
       ok: true,
       upstream: sseLines.at(-1).upstream,
     }).contentPlan.keySellingPoints, ["strong wind"], "clean SSE text remains parseable as a content plan result");
+
+    const flakyStreamContentPlan = await requestText(baseUrl, "/api/provider/content-plan-stream", {
+      providerRequest: Object.assign({}, contentPlanRequest, { endpoint: `${upstreamBaseUrl}/chat/flaky-stream` }),
+    });
+    const flakyStreamLines = flakyStreamContentPlan.text.trim().split("\n").map((line) => JSON.parse(line));
+    assert.strictEqual(flakyStreamLines.at(-1).ok, true, "stream LLM proxy succeeds after transient upstream failures before content starts");
+    assert.strictEqual(flakyStreamAttempts, 3, "stream LLM proxy retries transient failures up to three total attempts");
+    assert.strictEqual(flakyStreamLines.at(-1).upstream.attempts, 3, "stream retry count is returned to the caller");
+    assert.ok(flakyStreamLines.filter((event) => event.type === "chunk").map((event) => event.text).join("").includes("stream retry"), "stream retry only forwards chunks from the successful attempt");
 
     state.contentBrief.storyboardSceneCount = "10";
     state.contentBrief.storyboardDetailLevel = "dense";
@@ -373,6 +462,36 @@ async function main() {
       },
     });
     assert.strictEqual(videoConnection.ok, true, "video connection test validates config without generation");
+
+    const deepseekConnection = await request(baseUrl, "/api/provider/test", {
+      config: {
+        kind: "llm",
+        mode: "http",
+        provider: "deepseek",
+        apiStyle: "openai-chat",
+        endpoint: `${upstreamBaseUrl}/chat/completions`,
+        model: "deepseek-v4-pro",
+        apiKey: "test-key",
+      },
+    });
+    assert.strictEqual(deepseekConnection.ok, true, "DeepSeek connection test can pass for text LLM usage");
+    assert.strictEqual(deepseekConnection.capabilities.reverseStoryboard, false, "DeepSeek text model is marked unavailable for reverse storyboard");
+    assert.ok(deepseekConnection.warnings.some((warning) => /反推不可用|图片输入/.test(warning)), "DeepSeek connection test warns that reverse storyboard is unavailable");
+
+    const authFailureStart = upstreamCalls.length;
+    const authFailure = await request(baseUrl, "/api/provider/test", {
+      config: {
+        kind: "llm",
+        mode: "http",
+        provider: "deepseek",
+        apiStyle: "openai-chat",
+        endpoint: `${upstreamBaseUrl}/chat/auth-failure`,
+        model: "deepseek-v4-pro",
+        apiKey: "bad-key",
+      },
+    }, { expectOk: false });
+    assert.strictEqual(authFailure.response.status, 502, "LLM connection test maps upstream auth failure to 502");
+    assert.strictEqual(upstreamCalls.slice(authFailureStart).filter((call) => call.url === "/chat/auth-failure").length, 1, "auth failures are not retried");
 
     state.integrations.video = {
       mode: "http",

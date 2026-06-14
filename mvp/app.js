@@ -65,6 +65,20 @@ function saveState() {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
 }
 
+function safeImageLabel(value, fallback = "本地上传图片") {
+  const raw = String(value || "").trim();
+  const stem = raw.replace(/\.[^.]+$/, "").trim();
+  if (!stem) return fallback;
+  const compact = stem.replace(/[\s_.-]+/g, "");
+  const looksLikeCameraName = /^(img|image|dsc|pxl|screenshot|screen shot|wechat|wx|微信图片)[\s_.-]*/i.test(stem);
+  const hasUuidSegment = /[a-f0-9]{8}[\s_.-]*[a-f0-9]{4}/i.test(stem);
+  const hasLongHex = /[a-f0-9]{10,}/i.test(compact);
+  const hasLongOpaqueToken = compact.length > 18 && /^[a-z0-9]+$/i.test(compact);
+  const isSingleOpaqueToken = compact === stem && compact.length >= 8 && /^[a-z0-9]+$/i.test(compact) && !/[\u3400-\u9fff]/.test(compact);
+  if (looksLikeCameraName || hasUuidSegment || hasLongHex || hasLongOpaqueToken || isSingleOpaqueToken) return fallback;
+  return stem.slice(0, 18);
+}
+
 function toast(message) {
   const el = document.querySelector(".toast");
   if (!el) return;
@@ -1350,9 +1364,10 @@ function renderCreate() {
   const contentBrief = state.contentBrief || { seed: "", text: "" };
   const hasUrlMaterial = Boolean(String(product.imageUrl || "").trim());
   const hasUploadMaterial = Boolean(product.imageData);
+  const uploadImageLabel = safeImageLabel(product.imageLabel, "本地上传图片");
   const imagePreview = product.imageData
-    ? `<img src="${product.imageData}" alt="${h(product.name || product.imageLabel || "产品")} 产品图" />`
-    : `<div><span>${h(product.imageLabel || "图")}</span><strong>产品图</strong></div>`;
+    ? `<img src="${product.imageData}" alt="${h(product.name || "产品")} 产品图" />`
+    : `<div><span>${h(safeImageLabel(product.imageLabel, "图"))}</span><strong>产品图</strong></div>`;
   const latestPlan = latestContentPlanTask();
   const streamState = displayContentPlanStreamState(state.contentPlanStream);
   const storyboardStream = state.storyboardStream || {};
@@ -1406,7 +1421,7 @@ function renderCreate() {
                 <div class="field full"><label>图片 URL</label><input data-field="product.imageUrl" value="${h(product.imageUrl || "")}" placeholder="https://... 可填写公网图片地址" /></div>
                 <div class="compact-image-meta">
                   <span class="button">上传图片</span>
-                  <div class="chips">${hasUrlMaterial ? `<span class="chip">图片 URL</span>` : ""}${hasUploadMaterial ? `<span class="chip">上传图：${h(product.imageLabel || "本地图片")}</span>` : ""}${!hasUrlMaterial && !hasUploadMaterial ? `<span class="chip">未添加产品图</span>` : ""}</div>
+                  <div class="chips">${hasUrlMaterial ? `<span class="chip">图片 URL</span>` : ""}${hasUploadMaterial ? `<span class="chip">上传图：${h(uploadImageLabel)}</span>` : ""}${!hasUrlMaterial && !hasUploadMaterial ? `<span class="chip">未添加产品图</span>` : ""}</div>
                 </div>
               </div>
             </div>
@@ -1465,7 +1480,7 @@ function renderReverse() {
   const selectedFavorite = reverse.selectedFavoriteId ? Core.getById(state.favorites, reverse.selectedFavoriteId) : null;
   const selectedProductId = reverse.selectedProductId || state.selectedProductId;
   const selectedProduct = Core.getById(state.products, selectedProductId) || Core.getById(state.products, state.selectedProductId);
-  const selectedProductUploadLabel = selectedProduct && selectedProduct.imageData ? `已上传：${selectedProduct.imageLabel || "本地图片"}` : "上传产品图";
+  const selectedProductUploadLabel = selectedProduct && selectedProduct.imageData ? `已上传：${safeImageLabel(selectedProduct.imageLabel, "本地上传图片")}` : "上传产品图";
   return `
     <section class="reverse-screen stack">
       <div class="section-head">
@@ -1501,7 +1516,7 @@ function renderReverse() {
               <div>
                 <span>二创产品</span>
                 <select class="summary-control" data-field="reverseVideo.selectedProductId">
-                  ${state.products.map((product) => `<option value="${h(product.id)}" ${product.id === (selectedProduct && selectedProduct.id) ? "selected" : ""}>${h(product.name || product.imageLabel || "产品")}</option>`).join("")}
+                  ${state.products.map((product) => `<option value="${h(product.id)}" ${product.id === (selectedProduct && selectedProduct.id) ? "selected" : ""}>${h(product.name || "产品")}</option>`).join("")}
                 </select>
               </div>
               <div>
@@ -2468,7 +2483,8 @@ function renderPublishScheduler(task, readiness) {
 
 function renderScheduledQueue() {
   Core.markDueScheduledPosts(state);
-  const posts = Array.isArray(state.scheduledPosts) ? state.scheduledPosts : [];
+  const posts = (Array.isArray(state.scheduledPosts) ? state.scheduledPosts : [])
+    .filter((post) => post && !["cancelled", "published"].includes(post.status));
   if (!posts.length) return "";
   return `
     <div class="scheduled-queue panel">
@@ -2829,6 +2845,8 @@ function renderIntegrationCard(config) {
   const currentProvider = providerOptions.find((provider) => provider.id === value.provider);
   const testResult = state.connectionTests && state.connectionTests[key];
   const testIssue = testResult && !testResult.ok ? Core.explainProviderIssue(testResult, { kind: key }) : null;
+  const testWarnings = Array.isArray(testResult && testResult.warnings) ? testResult.warnings.filter(Boolean) : [];
+  const testWarningHtml = testWarnings.length ? `<div class="test-warnings">${testWarnings.map((warning) => `<small>${h(warning)}</small>`).join("")}</div>` : "";
   return `
     <div class="panel integration-card compact-integration-card">
       <div class="panel-head">
@@ -2857,7 +2875,7 @@ function renderIntegrationCard(config) {
             <button class="button" data-action="test-connection" data-connection-key="${key}">测试连接</button>
             <button class="button danger" data-action="clear-api-key" data-connection-key="${key}">清空 Key</button>
           </div>
-          ${testResult ? `<div class="test-result ${testResult.ok ? "success" : "danger"}"><strong>${testResult.ok ? "连接正常" : "连接失败"}</strong><span>${h(testResult.ok ? (testResult.message || "") : providerIssueInline(testResult, { kind: key }))}</span>${testIssue && testIssue.rawMessage ? `<small>${h(testIssue.rawMessage)}</small>` : ""}</div>` : ""}
+          ${testResult ? `<div class="test-result ${testResult.ok ? "success" : "danger"}"><strong>${testResult.ok ? "连接正常" : "连接失败"}</strong><span>${h(testResult.ok ? (testResult.message || "") : providerIssueInline(testResult, { kind: key }))}</span>${testWarningHtml}${testIssue && testIssue.rawMessage ? `<small>${h(testIssue.rawMessage)}</small>` : ""}</div>` : ""}
         </div>
       </div>
     </div>
@@ -3189,7 +3207,7 @@ function bindEvents() {
         const product = Core.getById(state.products, productId);
         if (!product) return;
         product.imageData = String(reader.result || "");
-        product.imageLabel = file.name.slice(0, 12);
+        product.imageLabel = safeImageLabel(file.name, "本地上传图片");
         saveState();
         renderShell();
         toast("产品图已保存到本地浏览器。");
@@ -4225,10 +4243,15 @@ async function testConnection(connectionKey) {
       error: result.error || "",
       checkedAt: result.checkedAt || new Date().toISOString(),
       provider: result.provider || config.provider,
+      warnings: Array.isArray(result.warnings) ? result.warnings : [],
+      capabilities: result.capabilities || {},
+      upstream: result.upstream || null,
     };
     saveState();
     renderShell();
-    toast(state.connectionTests[connectionKey].ok ? "连接测试通过。" : `连接测试失败：${state.connectionTests[connectionKey].error || state.connectionTests[connectionKey].message}`);
+    const savedResult = state.connectionTests[connectionKey];
+    const reverseUnavailable = savedResult.ok && savedResult.capabilities && savedResult.capabilities.reverseStoryboard === false;
+    toast(savedResult.ok ? (reverseUnavailable ? "连接测试通过，但当前模型反推不可用。" : "连接测试通过。") : `连接测试失败：${savedResult.error || savedResult.message}`);
   } catch (error) {
     state.connectionTests = state.connectionTests || {};
     state.connectionTests[connectionKey] = { ok: false, error: error.message, checkedAt: new Date().toISOString() };

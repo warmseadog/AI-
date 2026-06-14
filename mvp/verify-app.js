@@ -15,9 +15,9 @@ assert.strictEqual(localConfig.integrations.llm.model, "gpt-5.5", "local startup
 assert.strictEqual(localConfig.integrations.llm.endpoint, "https://toapis.com/v1/chat/completions", "local startup config uses GPT-5.5 endpoint");
 assert.deepStrictEqual(JSON.parse(JSON.stringify(localConfig.selectedPlatforms)), ["tiktok"], "local startup config selects TikTok only");
 assert.ok(indexHtml.includes("app.js?v="), "index references app.js with a cache-busting version");
-assert.ok(indexHtml.includes("styles.css?v=20260612-publish-feedback-label"), "index cache-busts publish feedback label styles");
-assert.ok(indexHtml.includes("core.js?v=20260613-reverse-product-simplify"), "index cache-busts reverse product setting core changes");
-assert.ok(indexHtml.includes("app.js?v=20260613-reverse-product-simplify"), "index cache-busts reverse product setting app changes");
+assert.ok(indexHtml.includes("styles.css?v=20260614-product-image-label"), "index cache-busts product image label styles");
+assert.ok(indexHtml.includes("core.js?v=20260614-product-image-label"), "index cache-busts product image label core changes");
+assert.ok(indexHtml.includes("app.js?v=20260614-product-image-label"), "index cache-busts product image label app changes");
 assert.ok(indexHtml.includes("local-config.js"), "index can load local ignored provider config before app startup");
 assert.ok(appJs.includes("loadReverseFrameData"), "app can inline extracted reverse frames for vision-capable LLMs");
 assert.ok(appJs.includes("openai-vision-chat"), "app documents the vision-capable LLM apiStyle for reverse reconstruction");
@@ -716,9 +716,26 @@ assert.ok(appHtml.includes('data-action="reschedule-scheduled-post"'), "schedule
 assert.ok(appHtml.includes("中文翻译参考"), "copy detail still exposes a Chinese reference translation");
 assert.ok(!appHtml.includes("首条评论"), "copy detail removes non-essential first-comment editing");
 assert.ok(!appHtml.includes("封面标题"), "copy detail removes non-essential cover-title editing");
+vm.runInContext(`
+  (() => {
+    Core.cancelScheduledPost(state, state.scheduledPosts[0].id);
+    renderShell();
+  })()
+`, sandbox);
+assert.ok(!appHtml.includes("定时发布队列"), "publish page hides the scheduled queue when every scheduled post is cancelled");
+assert.ok(!appHtml.includes("post-hosted-verify"), "publish page removes cancelled scheduled posts from the visible queue");
 
 sandbox.location.hash = "#create";
-vm.runInContext("view = initialView(); renderShell();", sandbox);
+vm.runInContext(`
+  (() => {
+    state.products[0].imageData = "data:image/png;base64,AAA";
+    state.products[0].imageLabel = "hfahfiajfaf.jpg";
+    view = initialView();
+    renderShell();
+  })()
+`, sandbox);
+assert.ok(!appHtml.includes("hfahfiajfaf"), "create page does not show short opaque uploaded image filenames");
+assert.ok(appHtml.includes("上传图：本地上传图片"), "create page uses a generic uploaded image label for random filenames");
 assert.ok(appHtml.includes("可编辑中文分镜脚本"), "create page renders a storyboard script box below the content plan");
 assert.ok(appHtml.includes("10 镜 · 高密度"), "create page keeps the storyboard preset control visible near generation actions");
 assert.ok(appHtml.includes('data-storyboard-script-text'), "create page storyboard script box is editable from one large textarea");
@@ -1078,7 +1095,19 @@ const visionReverseConfig = vm.runInContext("shouldInlineReverseFrames()", sandb
 assert.strictEqual(visionReverseConfig, true, "vision-capable LLM config is treated as frame-aware reverse config");
 
 sandbox.location.hash = "#settings";
-vm.runInContext("view = initialView(); renderShell();", sandbox);
+vm.runInContext(`
+  state.connectionTests = state.connectionTests || {};
+  state.connectionTests.llm = {
+    ok: true,
+    provider: "deepseek",
+    checkedAt: "2026-06-14T00:00:00.000Z",
+    message: "真实接口连接成功。",
+    warnings: ["注意：当前模型反推不可用。DeepSeek 文本模型不能读取关键帧图片；如需反推，请切换支持图片输入的视觉模型。"],
+    capabilities: { reverseStoryboard: false }
+  };
+  view = initialView();
+  renderShell();
+`, sandbox);
 assert.ok(appHtml.includes("必要配置"), "settings page is reduced to necessary configuration");
 assert.ok(!appHtml.includes("接口配置"), "settings page removes broad integration configuration wrapper");
 assert.ok(!appHtml.includes("http 真实接口"), "settings page hides fixed http mode");
@@ -1096,6 +1125,9 @@ assert.ok(appHtml.includes('data-action="apply-integration-profile"'), "settings
 assert.ok(appHtml.includes('data-action="save-integration-profile"'), "settings page can save the current model profile");
 assert.ok(appHtml.includes("DeepSeek V4 Pro"), "settings page shows local LLM profile");
 assert.ok(appHtml.includes("Seedance 2 Fast / ToAPIs"), "settings page shows local video model alternatives");
+assert.ok(appHtml.includes("连接正常"), "settings page keeps a successful LLM connection test as normal");
+assert.ok(appHtml.includes("当前模型反推不可用"), "settings page shows reverse-storyboard warning after successful DeepSeek connection test");
+assert.ok(appJs.includes("连接测试通过，但当前模型反推不可用"), "connection test toast distinguishes partial capability warnings from full success");
 assert.ok(!appHtml.includes("当前请求/响应预览"), "settings page removes request preview");
 assert.ok(!appHtml.includes("默认发布平台"), "settings page removes platform settings block");
 assert.ok(!appHtml.includes("工作区 ID"), "settings page hides optional publisher workspace id");

@@ -3180,6 +3180,12 @@ textarea:focus {
   color: var(--success);
 }
 
+.test-warnings {
+  display: grid;
+  gap: 3px;
+  color: var(--warning);
+}
+
 .test-result.danger {
   border: 1px solid #fecdca;
   background: #fff1f3;
