@@ -402,6 +402,16 @@ async function main() {
     const rejectedUpload = await requestRaw(baseUrl, "/api/uploads/video?filename=note.txt", Buffer.from("not-video"), "text/plain", { expectOk: false });
     assert.match(rejectedUpload.data.error, /mp4|mov|webm|视频/i, "non-video upload rejection explains accepted formats");
 
+    const rejectedImageUpload = await requestRaw(baseUrl, "/api/uploads/image?filename=note.txt", Buffer.from("not-image"), "text/plain", { expectOk: false });
+    assert.match(rejectedImageUpload.data.error, /png|jpg|jpeg|webp|图片/i, "non-image upload rejection explains accepted formats");
+
+    const uploadedImage = await requestRaw(baseUrl, "/api/uploads/image?filename=front.png", Buffer.from("verify-image"), "image/png");
+    assert.strictEqual(uploadedImage.upload.fileName, "front.png", "image upload returns file name");
+    assert.ok(uploadedImage.upload.url.startsWith("/outputs/uploads/"), "image upload returns browser URL");
+    assert.strictEqual(uploadedImage.upload.mimeType, "image/png", "image upload returns image mime type");
+    const uploadedImageFile = path.join(__dirname, "..", uploadedImage.upload.url);
+    assert.ok(fs.existsSync(uploadedImageFile), "image upload stores file under outputs uploads");
+
     const uploaded = await requestRaw(baseUrl, "/api/uploads/video?filename=reference.mp4", Buffer.from("verify-video"), "video/mp4");
     assert.strictEqual(uploaded.upload.fileName, "reference.mp4", "video upload returns file name");
     assert.ok(uploaded.upload.url.startsWith("/outputs/uploads/"), "video upload returns browser URL");

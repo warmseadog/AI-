@@ -51,6 +51,7 @@ assert.deepStrictEqual(state.reverseVideo, {
 assert.strictEqual(state.products[0].name, "", "default product name starts empty");
 assert.strictEqual(state.products[0].imageUrl, "", "default product image URL starts empty");
 assert.strictEqual(state.products[0].imageData, "", "default uploaded image starts empty");
+assert.deepStrictEqual(state.products[0].images, [], "default product starts with an empty reference image group");
 assert.strictEqual(state.contentBrief.seed, "", "default idea input starts empty");
 assert.strictEqual(state.contentBrief.text, "", "default generated plan text starts empty");
 assert.strictEqual(state.contentBrief.storyboardSceneCount, "auto", "default storyboard scene count is automatic");
@@ -167,6 +168,74 @@ assert.ok(planPayload.outputFields.includes("painPoints"), "content plan request
 assert.ok(planPayload.outputFields.includes("mustShow"), "content plan request asks for must-show visual requirements");
 assert.ok(!planPayload.outputFields.includes("storyboardGuidance"), "content plan request does not ask for storyboard guidance");
 assertNoDemoWaterText(planRequest, "content plan request");
+
+const imageGroupState = Core.createInitialState();
+const imageGroupProduct = imageGroupState.products[0];
+Core.addProductImage(imageGroupProduct, {
+  type: "url",
+  url: "https://example.test/front.png",
+  label: "正面主图",
+  role: "主图",
+  priority: 1,
+  useForVideo: true,
+});
+Core.addProductImage(imageGroupProduct, {
+  type: "url",
+  url: "https://example.test/side.png",
+  label: "侧面结构",
+  role: "侧面",
+  priority: 2,
+  useForVideo: true,
+});
+Core.addProductImage(imageGroupProduct, {
+  type: "upload",
+  dataUrl: "data:image/png;base64,SCENE",
+  label: "场景参考",
+  role: "场景",
+  priority: 3,
+  useForVideo: false,
+});
+imageGroupState.contentBrief.seed = "我想做一条展示产品多角度细节的短视频。";
+const imageGroupPlanRequest = Core.buildContentPlanProviderRequest(imageGroupState);
+const imageGroupPlanPayload = userMessagePayload(imageGroupPlanRequest);
+assert.strictEqual(imageGroupPlanPayload.materials.length, 3, "content plan request accepts multiple product reference images");
+assert.deepStrictEqual(imageGroupPlanPayload.materials.map((item) => item.role), ["主图", "侧面", "场景"], "content plan materials preserve reference image roles");
+assert.strictEqual(imageGroupPlanPayload.materials[2].useForVideo, false, "content plan materials preserve scene-only image usage");
+
+const imageGroupTask = Core.createContentPlanTask(imageGroupState, {
+  contentPlan: {
+    productUnderstanding: "多角度产品素材。",
+    targetAudience: "TikTok 美国用户。",
+    keySellingPoints: ["多角度展示"],
+    usageScenarios: ["开箱", "细节展示"],
+    strategy: "先看整体，再看结构细节。",
+    hook: "Look at the details",
+  },
+});
+imageGroupTask.storyboard = Core.normalizeStoryboardTiming([
+  {
+    time: "0-15s",
+    title: "多角度展示",
+    visual: "展示产品正面和侧面结构。",
+    subtitle: "Details matter.",
+    videoPrompt: "15 second vertical product detail showcase.",
+  },
+], 15);
+Object.assign(imageGroupState.integrations.video, {
+  mode: "http",
+  provider: "toapis-seedance",
+  apiStyle: "toapis-video",
+  endpoint: "https://toapis.com/v1/videos/generations",
+  statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+  model: "seedance-2-fast",
+  apiKey: "toapis-key",
+});
+const imageGroupVideoRequest = Core.buildVideoProviderRequest(imageGroupState, imageGroupTask, imageGroupProduct);
+assert.deepStrictEqual(imageGroupVideoRequest.body.image_urls, ["https://example.test/front.png", "https://example.test/side.png"], "ToAPIs video request sends video-enabled product reference URLs in priority order");
+assert.strictEqual(imageGroupVideoRequest.body.resolution, "720p", "ToAPIs video request sends lowercase resolution values accepted by the upstream API");
+assert.ok(imageGroupVideoRequest.body.prompt.includes("正面主图"), "video prompt names the primary product reference");
+assert.ok(imageGroupVideoRequest.body.prompt.includes("侧面结构"), "video prompt names secondary product references");
+assert.ok(imageGroupVideoRequest.body.prompt.includes("场景图只参考使用环境"), "video prompt keeps scene references from changing product identity");
 
 const toapisPreset = Core.videoProviders.find((provider) => provider.id === "toapis-seedance");
 assert.strictEqual(toapisPreset.name, "Seedance 2 / ToAPIs", "ToAPIs provider label covers standard and fast profiles");
@@ -803,6 +872,26 @@ state.products.push({
   imageLabel: "挂脖风扇产品图",
   imageUrl: "https://example.test/target-neck-fan.png",
   imageData: "",
+  images: [
+    {
+      id: "target-front",
+      type: "url",
+      url: "https://example.test/target-neck-fan-front.png",
+      label: "挂脖风扇正面",
+      role: "主图",
+      priority: 1,
+      useForVideo: true,
+    },
+    {
+      id: "target-side",
+      type: "url",
+      url: "https://example.test/target-neck-fan-side.png",
+      label: "挂脖风扇侧面",
+      role: "侧面",
+      priority: 2,
+      useForVideo: true,
+    },
+  ],
   audience: "夏季通勤和户外排队用户",
   sellingPoints: "免手持, 三档风速, 轻量便携",
   offer: "TikTok Shop 限时优惠",
@@ -828,7 +917,8 @@ assert.ok(reverseVideoProviderRequest.body.prompt.includes("最大程度复刻�
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("旁白"), "reverse video prompt includes voiceover guidance");
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("产品参考图为最高优先级"), "reverse video prompt locks the selected product reference image");
 assert.ok(reverseVideoProviderRequest.body.prompt.includes("不得改变产品颜色、外观轮廓、比例、材质和关键结构"), "reverse video prompt forbids product appearance drift");
-assert.deepStrictEqual(reverseVideoProviderRequest.body.image_urls, ["https://example.test/target-neck-fan.png"], "reverse video request uses selected product image URL");
+assert.deepStrictEqual(reverseVideoProviderRequest.body.image_urls, ["https://example.test/target-neck-fan-front.png", "https://example.test/target-neck-fan-side.png"], "reverse video request uses the selected product reference image group");
+assert.ok(reverseVideoProviderRequest.body.prompt.includes("挂脖风扇侧面"), "reverse video prompt includes secondary product reference labels");
 assert.strictEqual(reverseVideoProviderRequest.body.resolution, "480p", "ToAPIS video request uses the selected resolution");
 
 const waterPurifierRequest = Core.buildVideoProviderRequest(

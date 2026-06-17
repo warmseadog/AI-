@@ -140,6 +140,7 @@
     imageLabel: "产品图",
     imageUrl: "",
     imageData: "",
+    images: [],
     audience: "",
     sellingPoints: "",
     offer: "",
@@ -275,7 +276,7 @@
     state.scheduleDate = state.scheduleDate || base.scheduleDate;
     state.scheduleTime = state.scheduleTime || base.scheduleTime;
     state.scheduleTimezone = state.scheduleTimezone || base.scheduleTimezone;
-    state.products = state.products.map((product) => Object.assign({ detailsSaved: false }, product));
+    state.products = state.products.map(normalizeProduct);
     state.favorites = state.favorites.map((favorite) => Object.assign({}, favorite, {
       type: favorite.type === legacyFavoriteType ? "分镜脚本" : favorite.type,
     }));
@@ -479,6 +480,103 @@
     return name ? `${name} 产品图` : "上传产品图";
   }
 
+  const productImageRoles = ["主图", "正面", "侧面", "背面", "细节", "包装", "场景"];
+
+  function normalizeProductImageRole(value, fallback) {
+    const role = String(value || "").trim();
+    if (productImageRoles.includes(role)) return role;
+    return fallback || "细节";
+  }
+
+  function productImageFallbackRole(index) {
+    return index === 0 ? "主图" : "细节";
+  }
+
+  function normalizeProductImage(input, index = 0) {
+    if (!input || typeof input !== "object") return null;
+    const url = String(input.url || "").trim();
+    const dataUrl = String(input.dataUrl || input.dataURL || input.imageData || "").trim();
+    if (!url && !dataUrl) return null;
+    const type = url ? "url" : "upload";
+    const label = String(input.label || input.imageLabel || "").trim() || (type === "url" ? "图片 URL" : "上传产品图");
+    const priority = Number.isFinite(Number(input.priority)) ? Number(input.priority) : index + 1;
+    return {
+      id: String(input.id || uid("product-image")),
+      type,
+      url,
+      dataUrl,
+      label,
+      role: normalizeProductImageRole(input.role, productImageFallbackRole(index)),
+      priority,
+      useForVideo: input.useForVideo === false ? false : true,
+    };
+  }
+
+  function sortedProductImages(images) {
+    return (Array.isArray(images) ? images : [])
+      .map((image, index) => normalizeProductImage(image, index))
+      .filter(Boolean)
+      .sort((left, right) => (Number(left.priority || 0) - Number(right.priority || 0)) || String(left.id).localeCompare(String(right.id)));
+  }
+
+  function normalizeProduct(product) {
+    const normalized = Object.assign({ detailsSaved: false, images: [] }, product || {});
+    normalized.images = sortedProductImages(normalized.images);
+    return normalized;
+  }
+
+  function addProductImage(product, input) {
+    if (!product) return null;
+    const images = sortedProductImages(product.images);
+    const image = normalizeProductImage(Object.assign({}, input, {
+      priority: input && input.priority !== undefined ? input.priority : images.length + 1,
+      role: input && input.role || productImageFallbackRole(images.length),
+    }), images.length);
+    if (!image) return null;
+    images.push(image);
+    product.images = sortedProductImages(images);
+    if (image.type === "upload" && !String(product.imageData || "").trim()) {
+      product.imageData = image.dataUrl;
+      product.imageLabel = image.label || "产品图";
+    }
+    if (image.type === "url" && !String(product.imageUrl || "").trim()) {
+      product.imageUrl = image.url;
+    }
+    return image;
+  }
+
+  function updateProductImage(product, imageId, field, value) {
+    if (!product || !imageId) return null;
+    product.images = sortedProductImages(product.images);
+    const image = product.images.find((item) => item.id === imageId);
+    if (!image) return null;
+    if (field === "role") image.role = normalizeProductImageRole(value, image.role);
+    if (field === "label") image.label = String(value || "").trim() || image.label;
+    if (field === "priority") image.priority = Number.isFinite(Number(value)) ? Number(value) : image.priority;
+    if (field === "useForVideo") image.useForVideo = Boolean(value);
+    product.images = sortedProductImages(product.images);
+    return image;
+  }
+
+  function removeProductImage(product, imageId) {
+    if (!product || !imageId) return null;
+    product.images = sortedProductImages(product.images);
+    const index = product.images.findIndex((image) => image.id === imageId);
+    if (index < 0) return null;
+    const removed = product.images.splice(index, 1)[0];
+    product.images = sortedProductImages(product.images.map((image, imageIndex) => Object.assign({}, image, { priority: imageIndex + 1 })));
+    if (removed.dataUrl && product.imageData === removed.dataUrl) {
+      const nextUpload = product.images.find((image) => image.dataUrl);
+      product.imageData = nextUpload ? nextUpload.dataUrl : "";
+      product.imageLabel = nextUpload ? nextUpload.label : "产品图";
+    }
+    if (removed.url && product.imageUrl === removed.url) {
+      const nextUrl = product.images.find((image) => image.url);
+      product.imageUrl = nextUrl ? nextUrl.url : "";
+    }
+    return removed;
+  }
+
   function productAiContext(product) {
     if (!product || product.detailsSaved !== true) return {};
     const context = {
@@ -491,21 +589,54 @@
     return Object.fromEntries(Object.entries(context).filter(([, value]) => value));
   }
 
+  function materialFromProductImage(image) {
+    const material = {
+      type: image.type,
+      label: image.label || image.role || "产品参考图",
+      role: image.role || "细节",
+      priority: image.priority || 1,
+      useForVideo: image.useForVideo !== false,
+    };
+    if (image.url) material.url = image.url;
+    if (image.dataUrl) material.dataUrl = image.dataUrl;
+    return material;
+  }
+
   function productMaterials(product) {
+    if (product && Array.isArray(product.images) && product.images.length) {
+      return sortedProductImages(product.images).map(materialFromProductImage);
+    }
     const materials = [];
     const imageUrl = String(product && product.imageUrl || "").trim();
     if (imageUrl) {
-      materials.push({ type: "url", label: "图片 URL", url: imageUrl });
+      materials.push({ type: "url", label: "图片 URL", role: "主图", priority: 1, useForVideo: true, url: imageUrl });
     }
     const imageData = String(product && product.imageData || "").trim();
     if (imageData) {
       materials.push({
         type: "upload",
         label: productMaterialLabel(product),
+        role: materials.length ? "细节" : "主图",
+        priority: materials.length + 1,
+        useForVideo: true,
         dataUrl: imageData,
       });
     }
     return materials;
+  }
+
+  function videoProductMaterials(product) {
+    return productMaterials(product).filter((material) => material.useForVideo !== false);
+  }
+
+  function materialUrl(material) {
+    return material && String(material.url || material.dataUrl || "").trim();
+  }
+
+  function httpMaterialUrls(materials) {
+    return materials
+      .map((material) => String(material.url || "").trim())
+      .filter((url) => /^https?:\/\//i.test(url));
   }
 
   function listItemText(value) {
@@ -1483,10 +1614,19 @@
   }
 
   function productVisualIdentityPrompt(product, productName) {
-    const hasReferenceImage = Boolean(product && String(product.imageUrl || product.imageData || "").trim());
+    const materials = productMaterials(product);
+    const videoMaterials = videoProductMaterials(product);
+    const hasReferenceImage = Boolean(materials.length);
     const nameText = [productName, product && product.name].filter(Boolean).join(" ");
+    const referenceLines = materials.map((material, index) => {
+      const usage = material.useForVideo === false ? "仅用于场景理解，不作为产品外观参考" : "参与产品外观参考";
+      return `${index + 1}. ${material.role || "参考图"}：${material.label || "产品参考图"}，${usage}`;
+    });
     const genericLock = [
       "产品参考图为最高优先级：视频中的产品必须严格匹配所选产品参考图。",
+      referenceLines.length ? `产品参考图组：\n${referenceLines.join("\n")}` : "",
+      videoMaterials.length > 1 ? "主图决定整体外观；正面、侧面、背面和细节图只用于补全结构，不得互相混淆或生成另一款产品。" : "",
+      materials.some((material) => material.role === "场景" || material.useForVideo === false) ? "场景图只参考使用环境、手部动作和氛围，不得改变产品本体的颜色、轮廓、比例、材质和关键结构。" : "",
       "不得改变产品颜色、外观轮廓、比例、材质和关键结构；不得改成同类但不同款产品；不得自动美化成其他品牌或其他型号。",
       "允许改变镜头角度、光线和场景，但产品本体的形状、配色、部件位置、面板/按钮/出水口/托盘等关键细节必须保持一致。",
       hasReferenceImage ? "如果视频模型支持图生视频，必须把所选产品图作为产品身份参考，而不是只按文字想象产品。" : "",
@@ -1514,6 +1654,9 @@
     task.videoResolution = normalizeVideoResolution(task.videoResolution || task.contentBrief?.videoResolution || state.contentBrief?.videoResolution);
     const details = productAiContext(product);
     const productName = details.name || productDisplayName(product);
+    const videoMaterials = videoProductMaterials(product);
+    const videoMaterialUrls = videoMaterials.map(materialUrl).filter(Boolean);
+    const videoHttpUrls = httpMaterialUrls(videoMaterials);
     const visualIdentity = productVisualIdentityPrompt(product, productName);
     const productFacts = [
       `生成产品：${productName}`,
@@ -1553,7 +1696,7 @@
     const stylePrompt = task.videoStyleInstruction || "";
     const fullPrompt = [productFacts, sourceFidelityPrompt, stylePrompt, durationPrompt, prompt].filter(Boolean).join("\n");
     if (integration.apiStyle === "dashscope-video") {
-      const imageUrl = product && String(product.imageUrl || product.imageData || "").trim();
+      const imageUrl = videoMaterialUrls[0] || "";
       const isWan27 = /^wan2\.7-/i.test(String(integration.model || ""));
       const input = isWan27
         ? {
@@ -1583,7 +1726,6 @@
       };
     }
     if (integration.apiStyle === "toapis-video") {
-      const imageUrl = product && String(product.imageUrl || "").trim();
       const requestedDuration = Number(task.duration || 10);
       const viduQ3 = isViduQ3Model(integration.model);
       const submittedDuration = viduQ3 ? normalizeViduQ3Duration(requestedDuration) : normalizeToApisDuration(requestedDuration);
@@ -1592,11 +1734,11 @@
         prompt: fullPrompt,
         duration: submittedDuration,
         aspect_ratio: task.ratio || "9:16",
-        resolution: providerVideoResolution(task.videoResolution, !viduQ3),
+        resolution: providerVideoResolution(task.videoResolution),
       };
       if (viduQ3) body.audio = true;
-      if (/^https?:\/\//i.test(imageUrl)) {
-        body.image_urls = [imageUrl];
+      if (videoHttpUrls.length) {
+        body.image_urls = videoHttpUrls;
       }
       return {
         provider: integration.provider,
@@ -3030,6 +3172,7 @@
     if (!product) return null;
     product.imageData = "";
     product.imageLabel = "产品图";
+    product.images = [];
     return product;
   }
 
@@ -3082,6 +3225,12 @@
     deleteIntegrationProfile,
     getById,
     strategyLabel,
+    productImageRoles,
+    productMaterials,
+    videoProductMaterials,
+    addProductImage,
+    updateProductImage,
+    removeProductImage,
     addFavorite,
     generateContentBrief,
     normalizeReverseStoryboard,

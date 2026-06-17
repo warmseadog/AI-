@@ -66,6 +66,66 @@ function saveState() {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
 }
 
+const STREAM_UI_UPDATE_MS = 160;
+const streamUiUpdateTimers = {};
+
+function streamLogStatusClass(kind, status) {
+  if (status === "error") return "danger";
+  if (status === "streaming") return "warning";
+  if (kind === "storyboard" && status === "done") return "success";
+  return "info";
+}
+
+function streamLogText(kind, streamState) {
+  const stateForDisplay = streamState || {};
+  if (kind === "content-plan" && stateForDisplay.status === "streaming") {
+    return "模型正在后台生成内容规划，结果会在完成后写入内容规划框。你可以继续查看或编辑分镜脚本。";
+  }
+  return stateForDisplay.text || (kind === "storyboard" ? "生成分镜时，这里会显示模型返回过程。" : "生成内容规划时，这里会显示模型返回过程。");
+}
+
+function flushStreamUi(kind) {
+  if (view !== "create") return;
+  const streamState = kind === "storyboard" ? state.storyboardStream : displayContentPlanStreamState(state.contentPlanStream);
+  if (!streamState) return;
+  const log = document.querySelector(`[data-stream-log="${kind}"]`);
+  if (!log) return;
+  const status = log.querySelector("[data-stream-status]");
+  const text = log.querySelector("[data-stream-text]");
+  if (status) {
+    status.className = `status ${streamLogStatusClass(kind, streamState.status)}`;
+    status.textContent = streamState.label || "等待生成";
+  }
+  if (text) text.textContent = streamLogText(kind, streamState);
+  if (kind === "storyboard" && streamState.status === "streaming") {
+    const editor = document.querySelector("[data-storyboard-script-text]");
+    if (editor) editor.value = String(streamState.text || "");
+  }
+}
+
+function scheduleStreamUiUpdate(kind) {
+  if (view !== "create") return;
+  if (streamUiUpdateTimers[kind]) return;
+  streamUiUpdateTimers[kind] = setTimeout(() => {
+    streamUiUpdateTimers[kind] = null;
+    flushStreamUi(kind);
+  }, STREAM_UI_UPDATE_MS);
+}
+
+function updateStreamState(kind, stateKey, patch) {
+  state[stateKey] = Object.assign({
+    status: "idle",
+    label: "等待生成",
+    text: "",
+  }, state[stateKey] || {}, patch || {});
+  if (state[stateKey].status === "streaming") {
+    scheduleStreamUiUpdate(kind);
+    return;
+  }
+  saveState();
+  if (view === "create") renderShell();
+}
+
 function safeImageLabel(value, fallback = "本地上传图片") {
   const raw = String(value || "").trim();
   const stem = raw.replace(/\.[^.]+$/, "").trim();
@@ -483,10 +543,10 @@ function startPending(action) {
   return true;
 }
 
-function finishPending(action) {
+function finishPending(action, options = {}) {
   pendingActions.delete(action);
   saveState();
-  renderShell();
+  if (options.render !== false) renderShell();
 }
 
 function favoriteHeart(source) {
@@ -919,6 +979,71 @@ function syncDraftForm() {
     const task = Core.getById(state.tasks, el.dataset.storyboardScriptTaskId) || latestContentPlanTask();
     syncStoryboardScriptText(task, el.value);
   });
+}
+
+async function uploadProductImageBlob(blob, filename) {
+  if (!isServerMode()) {
+    return { url: "", dataUrl: await blobToDataUrl(blob), fileName: filename };
+  }
+  const response = await fetch(`/api/uploads/image?filename=${encodeURIComponent(filename || "product-image.png")}`, {
+    method: "POST",
+    headers: { "content-type": blob.type || "image/png" },
+    body: blob,
+  });
+  const data = await response.json();
+  if (!response.ok || data.ok === false || !data.upload) {
+    throw new Error(data.error || "图片上传失败。");
+  }
+  return data.upload;
+}
+
+async function uploadProductImageFile(file) {
+  return uploadProductImageBlob(file, file.name || "product-image.png");
+}
+
+async function uploadLegacyProductImageIfNeeded(product) {
+  if (!product || !product.imageData || (Array.isArray(product.images) && product.images.length)) return;
+  if (!isServerMode()) return;
+  const response = await fetch(product.imageData);
+  const blob = await response.blob();
+  const label = safeImageLabel(product.imageLabel, "上传产品图");
+  const upload = await uploadProductImageBlob(blob, `${label || "product-image"}.png`);
+  Core.addProductImage(product, {
+    type: "url",
+    url: upload.url,
+    label,
+    role: "主图",
+    useForVideo: true,
+  });
+  product.imageData = "";
+  product.imageLabel = "产品图";
+}
+
+async function handleProductReferenceImagesUpload(input, files) {
+  const imageFiles = (files || []).filter((file) => /^image\//i.test(file.type || "") || /\.(png|jpe?g|webp|gif)$/i.test(file.name || ""));
+  if (!imageFiles.length) {
+    toast("请选择图片文件。");
+    return;
+  }
+  const productId = input.dataset.productId || state.selectedProductId;
+  const product = Core.getById(state.products, productId);
+  if (!product) return;
+  await uploadLegacyProductImageIfNeeded(product);
+  const uploads = await Promise.all(imageFiles.map(uploadProductImageFile));
+  uploads.forEach((upload, index) => {
+    const file = imageFiles[index];
+    Core.addProductImage(product, {
+      type: upload.url ? "url" : "upload",
+      url: upload.url || "",
+      dataUrl: upload.dataUrl || "",
+      label: safeImageLabel(file.name, "上传产品图"),
+      role: product.images && product.images.length ? "细节" : "主图",
+      useForVideo: true,
+    });
+  });
+  saveState();
+  renderShell();
+  toast(`${imageFiles.length} 张产品参考图已保存。`);
 }
 
 async function callProvider(kind, providerRequest) {
@@ -1358,15 +1483,15 @@ function displayContentPlanStreamState(value) {
 function renderContentPlanGenerationLog(streamState) {
   const stateForDisplay = streamState || {};
   const label = stateForDisplay.label || "等待生成";
-  const text = stateForDisplay.text || "生成内容规划时，这里会显示模型返回过程。";
+  const text = streamLogText("content-plan", stateForDisplay);
   const statusClass = stateForDisplay.status === "error" ? "danger" : stateForDisplay.status === "streaming" ? "warning" : "info";
   return `
-    <div class="content-plan-generation-log" aria-live="polite">
+    <div class="content-plan-generation-log" data-stream-log="content-plan" aria-live="polite">
       <div class="stream-head">
         <strong>生成状态</strong>
-        <span class="status ${statusClass}">${h(label)}</span>
+        <span class="status ${statusClass}" data-stream-status>${h(label)}</span>
       </div>
-      <pre>${h(text)}</pre>
+      <pre data-stream-text>${h(text)}</pre>
     </div>
   `;
 }
@@ -1408,12 +1533,12 @@ function renderStoryboardGenerationLog(streamState) {
   const text = stateForDisplay.text || "生成分镜时，这里会显示模型返回过程。";
   const statusClass = stateForDisplay.status === "error" ? "danger" : stateForDisplay.status === "streaming" ? "warning" : stateForDisplay.status === "done" ? "success" : "info";
   return `
-    <div class="content-plan-generation-log storyboard-generation-log" aria-live="polite">
+    <div class="content-plan-generation-log storyboard-generation-log" data-stream-log="storyboard" aria-live="polite">
       <div class="stream-head">
         <strong>分镜生成状态</strong>
-        <span class="status ${statusClass}">${h(label)}</span>
+        <span class="status ${statusClass}" data-stream-status>${h(label)}</span>
       </div>
-      <pre>${h(text)}</pre>
+      <pre data-stream-text>${h(text)}</pre>
     </div>
   `;
 }
@@ -1519,15 +1644,87 @@ function renderVideoBatchControls(contentBrief) {
   `;
 }
 
+function renderProductImageRoleOptions(value) {
+  return Core.productImageRoles.map((role) => `<option value="${h(role)}" ${role === value ? "selected" : ""}>${h(role)}</option>`).join("");
+}
+
+function renderProductReferenceGroup(product, options = {}) {
+  const productId = product && product.id || "";
+  const images = Array.isArray(product && product.images) ? product.images : [];
+  const materials = Core.productMaterials(product || {});
+  const videoMaterials = Core.videoProductMaterials(product || {});
+  const hasMaterials = Boolean(materials.length);
+  const title = options.title || "产品参考图组";
+  const rows = images.map((image) => {
+    const preview = image.dataUrl || image.url
+      ? `<img src="${h(image.dataUrl || image.url)}" alt="${h(image.label || image.role || "产品参考图")}" />`
+      : `<span>${h(image.role || "图")}</span>`;
+    return `
+      <div class="reference-image-row">
+        <div class="reference-image-thumb">${preview}</div>
+        <div class="reference-image-main">
+          <input class="reference-label-input" data-product-image-field="label" data-product-id="${h(productId)}" data-product-image-id="${h(image.id)}" value="${h(image.label || "")}" aria-label="产品参考图名称" />
+          <div class="reference-image-controls">
+            <label>
+              <span>角色</span>
+              <select data-product-image-field="role" data-product-id="${h(productId)}" data-product-image-id="${h(image.id)}">
+                ${renderProductImageRoleOptions(image.role || "细节")}
+              </select>
+            </label>
+            <label class="reference-checkbox">
+              <input type="checkbox" data-product-image-field="useForVideo" data-product-id="${h(productId)}" data-product-image-id="${h(image.id)}" ${image.useForVideo === false ? "" : "checked"} />
+              <span>参与视频</span>
+            </label>
+          </div>
+        </div>
+        <button class="button icon-button" data-action="remove-product-reference-image" data-product-id="${h(productId)}" data-product-image-id="${h(image.id)}" title="移除参考图">×</button>
+      </div>
+    `;
+  }).join("");
+  const legacyRows = !images.length && hasMaterials
+    ? materials.map((material) => {
+        const preview = material.dataUrl || material.url
+          ? `<img src="${h(material.dataUrl || material.url)}" alt="${h(material.label || "产品参考图")}" />`
+          : `<span>${h(material.role || "图")}</span>`;
+        return `
+          <div class="reference-image-row reference-legacy-row">
+            <div class="reference-image-thumb">${preview}</div>
+            <div class="reference-image-main">
+              <strong>${h(material.label || "单图主图")}</strong>
+              <span class="muted">${h(material.role || "主图")} · 参与视频</span>
+            </div>
+          </div>
+        `;
+      }).join("")
+    : "";
+  return `
+    <div class="product-reference-group">
+      <div class="reference-group-head">
+        <div>
+          <strong>${h(title)}</strong><span class="muted"> ${hasMaterials ? `${materials.length} 张 · ${videoMaterials.length || 0} 参与视频` : "一张也可开始"}</span>
+        </div>
+        <span class="status ${hasMaterials ? "success" : "danger"}">${hasMaterials ? "图片已就绪" : "缺少图片"}</span>
+      </div>
+      <div class="reference-actions">
+        <label class="button">
+          上传参考图
+          <input type="file" accept="image/*" data-file="product-reference-images" data-product-id="${h(productId)}" multiple hidden />
+        </label>
+        <input type="file" accept="image/*" data-file="product-image" data-product-id="${h(productId)}" hidden />
+        <button class="button" data-action="clear-product-image" data-product-id="${h(productId)}">清空上传图</button>
+      </div>
+      <div class="reference-image-list">
+        ${rows || legacyRows || `<div class="reference-empty">上传主图即可进入流程；多图用于补全正面、侧面和细节。</div>`}
+      </div>
+    </div>
+  `;
+}
+
 function renderCreate() {
   const product = Core.getById(state.products, state.selectedProductId);
   const contentBrief = state.contentBrief || { seed: "", text: "" };
-  const hasUrlMaterial = Boolean(String(product.imageUrl || "").trim());
-  const hasUploadMaterial = Boolean(product.imageData);
-  const uploadImageLabel = safeImageLabel(product.imageLabel, "本地上传图片");
-  const imagePreview = product.imageData
-    ? `<img src="${product.imageData}" alt="${h(product.name || "产品")} 产品图" />`
-    : `<div><span>${h(safeImageLabel(product.imageLabel, "图"))}</span><strong>产品图</strong></div>`;
+  const productMaterials = Core.productMaterials(product);
+  const hasProductMaterials = Boolean(productMaterials.length);
   const latestPlan = latestContentPlanTask();
   const streamState = displayContentPlanStreamState(state.contentPlanStream);
   const storyboardStream = state.storyboardStream || {};
@@ -1570,23 +1767,14 @@ function renderCreate() {
           </div>
 
           <div class="panel product-panel">
-            <div class="panel-head"><h2>产品图</h2><div class="actions"><span class="status ${hasUrlMaterial || hasUploadMaterial ? "success" : "danger"}">${hasUrlMaterial || hasUploadMaterial ? "图片已就绪" : "缺少图片"}</span><button class="button" data-action="clear-product-image">清空上传图</button><span class="status info">草稿自动保存</span></div></div>
+            <div class="panel-head"><h2>产品图</h2><div class="actions"><span class="status ${hasProductMaterials ? "success" : "danger"}">${hasProductMaterials ? "图片已就绪" : "缺少图片"}</span><span class="status info">草稿自动保存</span></div></div>
             <div class="panel-body">
-            <div class="product-input product-image-compact">
-              <label class="image-uploader compact ${product.imageData ? "has-image" : ""}">
-                ${imagePreview}
-                <input type="file" accept="image/*" data-file="product-image" hidden />
-              </label>
-              <div class="compact-image-fields">
+              <div class="product-image-simplified">
                 <div class="field full"><label>图片 URL</label><input data-field="product.imageUrl" value="${h(product.imageUrl || "")}" placeholder="https://... 可填写公网图片地址" /></div>
-                <div class="compact-image-meta">
-                  <span class="button">上传图片</span>
-                  <div class="chips">${hasUrlMaterial ? `<span class="chip">图片 URL</span>` : ""}${hasUploadMaterial ? `<span class="chip">上传图：${h(uploadImageLabel)}</span>` : ""}${!hasUrlMaterial && !hasUploadMaterial ? `<span class="chip">未添加产品图</span>` : ""}</div>
-                </div>
+                ${renderProductReferenceGroup(product)}
               </div>
             </div>
           </div>
-        </div>
 
           <div class="panel">
             <div class="panel-head"><h2>规划结果</h2><span class="tag">真实返回</span></div>
@@ -1640,7 +1828,6 @@ function renderReverse() {
   const selectedFavorite = reverse.selectedFavoriteId ? Core.getById(state.favorites, reverse.selectedFavoriteId) : null;
   const selectedProductId = reverse.selectedProductId || state.selectedProductId;
   const selectedProduct = Core.getById(state.products, selectedProductId) || Core.getById(state.products, state.selectedProductId);
-  const selectedProductUploadLabel = selectedProduct && selectedProduct.imageData ? `已上传：${safeImageLabel(selectedProduct.imageLabel, "本地上传图片")}` : "上传产品图";
   return `
     <section class="reverse-screen stack">
       <div class="section-head">
@@ -1683,12 +1870,8 @@ function renderReverse() {
                 <span>图片 URL</span>
                 <input class="summary-control" data-product-field="imageUrl" data-product-id="${h(selectedProduct && selectedProduct.id || "")}" value="${h(selectedProduct && selectedProduct.imageUrl || "")}" placeholder="https://..." />
               </div>
-              <div>
-                <span>上传图片</span>
-                <label class="button summary-control">
-                  ${h(selectedProductUploadLabel)}
-                  <input type="file" accept="image/*" data-file="product-image" data-product-id="${h(selectedProduct && selectedProduct.id || "")}" hidden />
-                </label>
+              <div class="settings-summary-full">
+                ${renderProductReferenceGroup(selectedProduct, { title: "产品参考图组" })}
               </div>
               <div>
                 <span>二创数量</span>
@@ -3349,8 +3532,23 @@ function bindEvents() {
     el.addEventListener("change", saveProductField);
   });
 
+  document.querySelectorAll("[data-product-image-field]").forEach((el) => {
+    const saveProductImageField = () => {
+      const productId = el.dataset.productId || state.selectedProductId;
+      const imageId = el.dataset.productImageId;
+      if (!imageId) return;
+      const product = Core.getById(state.products, productId);
+      if (!product) return;
+      const value = el.type === "checkbox" ? el.checked : el.value;
+      Core.updateProductImage(product, imageId, el.dataset.productImageField, value);
+      saveState();
+      renderShell();
+    };
+    el.addEventListener("change", saveProductImageField);
+  });
+
   document.querySelectorAll("[data-file]").forEach((el) => {
-    el.addEventListener("change", () => {
+    el.addEventListener("change", async () => {
       const file = el.files && el.files[0];
       if (!file) return;
       if (el.dataset.file === "import-state") {
@@ -3361,18 +3559,34 @@ function bindEvents() {
         handleReverseVideoUpload(file);
         return;
       }
-      const reader = new FileReader();
-      reader.onload = () => {
+      if (el.dataset.file === "product-reference-images") {
+        try {
+          await handleProductReferenceImagesUpload(el, Array.from(el.files || []));
+        } catch (error) {
+          toast(`图片读取失败：${error.message}`);
+        }
+        return;
+      }
+      uploadProductImageFile(file).then((upload) => {
         const productId = el.dataset.productId || state.selectedProductId;
         const product = Core.getById(state.products, productId);
         if (!product) return;
-        product.imageData = String(reader.result || "");
-        product.imageLabel = safeImageLabel(file.name, "本地上传图片");
+        Core.addProductImage(product, {
+          type: upload.url ? "url" : "upload",
+          url: upload.url || "",
+          dataUrl: upload.dataUrl || "",
+          label: safeImageLabel(file.name, "本地上传图片"),
+          role: product.images && product.images.length ? "细节" : "主图",
+          useForVideo: true,
+        });
+        if (upload.url) {
+          product.imageData = "";
+          product.imageLabel = "产品图";
+        }
         saveState();
         renderShell();
         toast("产品图已保存到本地浏览器。");
-      };
-      reader.readAsDataURL(file);
+      }).catch((error) => toast(`图片读取失败：${error.message}`));
     });
   });
 
@@ -3459,6 +3673,14 @@ async function handleAction(dataset) {
     saveState();
     renderShell();
     toast("产品图已清空。");
+    return;
+  }
+  if (action === "remove-product-reference-image") {
+    const product = Core.getById(state.products, productId || state.selectedProductId);
+    Core.removeProductImage(product, dataset.productImageId);
+    saveState();
+    renderShell();
+    toast("已移除产品参考图。");
     return;
   }
   if (action === "save-integration") {
@@ -4523,23 +4745,11 @@ async function generateCopyForPlatform(task, platformId) {
 }
 
 function updateContentPlanStream(patch) {
-  state.contentPlanStream = Object.assign({
-    status: "idle",
-    label: "等待生成",
-    text: "",
-  }, state.contentPlanStream || {}, patch || {});
-  saveState();
-  renderShell();
+  updateStreamState("content-plan", "contentPlanStream", patch);
 }
 
 function updateStoryboardStream(patch) {
-  state.storyboardStream = Object.assign({
-    status: "idle",
-    label: "等待生成",
-    text: "",
-  }, state.storyboardStream || {}, patch || {});
-  saveState();
-  renderShell();
+  updateStreamState("storyboard", "storyboardStream", patch);
 }
 
 async function generateContentPlanWithUi(action, options = {}) {
@@ -4575,19 +4785,18 @@ async function generateContentPlanWithUi(action, options = {}) {
     if (task.contentPlan) task.contentPlan.rawText = task.contentPlanText;
     state.storyboardStream = { status: "idle", label: "等待生成", text: "" };
     state.selectedTaskId = task.id;
-    view = "create";
     const streamedLength = String(state.contentPlanStream?.text || "").length;
+    finishPending(action, { render: false });
     updateContentPlanStream({
       status: "done",
       label: "内容规划已生成",
       text: `已收到模型返回${streamedLength ? `（流式片段约 ${streamedLength} 字符）` : ""}，内容规划已写入下方可编辑中文规划框。`,
       rawText: task.contentPlanText,
     });
-    finishPending(action);
     toast(options.keepPrevious ? "内容规划已重新生成，可恢复上一版。" : "内容规划已生成，可以继续生成分镜。");
   } catch (error) {
+    finishPending(action, { render: false });
     updateContentPlanStream({ status: "error", label: "生成失败", text: `${state.contentPlanStream?.text || ""}\n\n错误：${error.message}`.trim() });
-    finishPending(action);
     toast(`内容规划生成失败：${error.message}`);
   }
 }
@@ -4629,23 +4838,23 @@ async function generateStoryboardFromPlanWithUi(action) {
     task.status = "storyboard_ready";
     state.selectedTaskId = task.id;
     const streamedLength = String(state.storyboardStream?.text || "").length;
+    finishPending(action, { render: false });
     updateStoryboardStream({
       status: "done",
       label: "分镜脚本已生成",
       text: `已收到模型返回${streamedLength ? `（流式片段约 ${streamedLength} 字符）` : ""}，分镜脚本已写入上方可编辑中文分镜框。`,
       rawText: task.storyboardScriptText,
     });
-    finishPending(action);
     saveState();
-    renderShell();
+    if (view === "create") renderShell();
     toast(`已生成 ${task.storyboard.length} 镜分镜，可在当前页检查后再进入审核生成视频。`);
   } catch (error) {
-    finishPending(action);
+    finishPending(action, { render: false });
     task.status = "content_plan_ready";
     task.reviewNote = error.message;
     updateStoryboardStream({ status: "error", label: "生成失败", text: `${state.storyboardStream?.text || ""}\n\n错误：${error.message}`.trim() });
     saveState();
-    renderShell();
+    if (view === "create") renderShell();
     toast(`分镜生成失败：${error.message}`);
   }
 }

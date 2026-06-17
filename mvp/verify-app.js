@@ -15,12 +15,14 @@ assert.strictEqual(localConfig.integrations.llm.model, "gpt-5.5", "local startup
 assert.strictEqual(localConfig.integrations.llm.endpoint, "https://toapis.com/v1/chat/completions", "local startup config uses GPT-5.5 endpoint");
 assert.deepStrictEqual(JSON.parse(JSON.stringify(localConfig.selectedPlatforms)), ["tiktok"], "local startup config selects TikTok only");
 assert.ok(indexHtml.includes("app.js?v="), "index references app.js with a cache-busting version");
-assert.ok(indexHtml.includes("styles.css?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue styles");
-assert.ok(indexHtml.includes("core.js?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue core changes");
-assert.ok(indexHtml.includes("app.js?v=20260614-dashboard-task-queue"), "index cache-busts dashboard task queue app changes");
+assert.ok(indexHtml.includes("styles.css?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix styles");
+assert.ok(indexHtml.includes("core.js?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix core changes");
+assert.ok(indexHtml.includes("app.js?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix app changes");
 assert.ok(indexHtml.includes("local-config.js"), "index can load local ignored provider config before app startup");
 assert.ok(appJs.includes("loadReverseFrameData"), "app can inline extracted reverse frames for vision-capable LLMs");
 assert.ok(appJs.includes("openai-vision-chat"), "app documents the vision-capable LLM apiStyle for reverse reconstruction");
+assert.ok(appJs.includes("uploadProductImageFile"), "app uploads product images through the local server instead of storing large data URLs");
+assert.ok(appJs.includes("/api/uploads/image"), "app uses the product image upload endpoint");
 assert.ok(appJs.includes("supportsReverseVisionModel"), "app auto-detects vision-capable reverse models");
 assert.ok(appJs.includes("gpt-5.5"), "app treats GPT-5.5 as a reverse vision-capable model");
 assert.ok(!appJs.includes('text: task.contentPlanText'), "content plan stream completion does not duplicate the final editable plan text");
@@ -735,7 +737,7 @@ vm.runInContext(`
   })()
 `, sandbox);
 assert.ok(!appHtml.includes("hfahfiajfaf"), "create page does not show short opaque uploaded image filenames");
-assert.ok(appHtml.includes("上传图：本地上传图片"), "create page uses a generic uploaded image label for random filenames");
+assert.ok(appHtml.includes("上传产品图"), "create page uses a generic uploaded image label for random filenames");
 assert.ok(appHtml.includes("可编辑中文分镜脚本"), "create page renders a storyboard script box below the content plan");
 assert.ok(appHtml.includes("10 镜 · 高密度"), "create page keeps the storyboard preset control visible near generation actions");
 assert.ok(appHtml.includes('data-storyboard-script-text'), "create page storyboard script box is editable from one large textarea");
@@ -922,10 +924,14 @@ vm.runInContext("view = initialView(); renderShell();", sandbox);
 assert.ok(appHtml.includes("新建内容规划"), "create page is focused on content planning");
 assert.ok(appHtml.includes('data-field="contentBrief.seed"'), "create page renders the rough idea input");
 assert.ok(appHtml.includes('data-file="product-image"'), "create page renders product image upload");
+assert.ok(appHtml.includes("产品参考图组"), "create page renders product reference image group");
+assert.ok(appHtml.includes('data-file="product-reference-images"'), "create page renders multi-image upload input");
+assert.ok(appHtml.includes("multiple"), "create page allows selecting multiple product reference images");
 assert.ok(appHtml.includes('data-field="product.imageUrl"'), "create page renders product image URL input");
 assert.ok(appHtml.includes('data-action="generate-content-plan"'), "create page exposes the real content plan generation action");
 assert.ok(appHtml.includes("规划结果"), "create page renders content plan result area");
-assert.ok(appHtml.includes("product-image-compact"), "create page uses a compact product image module");
+assert.ok(appHtml.includes("product-image-simplified"), "create page uses a simplified product image module");
+assert.ok(!appHtml.includes("reference-empty-controls"), "create page does not render disabled placeholder controls in the image group");
 assert.ok(appHtml.includes("create-layout-vertical"), "create page uses a vertical workflow layout");
 assert.ok(appHtml.includes("content-plan-big-editor"), "create page renders one large editable content plan box");
 assert.ok(appHtml.includes("data-content-plan-text"), "create page exposes one editable content plan text field");
@@ -939,6 +945,44 @@ assert.ok(appHtml.includes("content-plan-generation-log"), "create page keeps ge
 assert.ok(!appHtml.includes("content-plan-result"), "create page no longer renders a separate content plan summary card");
 assert.ok(!appHtml.includes("<span>产品理解</span>"), "create page does not duplicate product understanding in a summary grid");
 assert.ok(!appHtml.includes("<span>视频节奏</span>"), "create page does not duplicate rhythm in a summary grid");
+const streamingRenderCount = vm.runInContext(`
+  (() => {
+    const originalRenderShell = renderShell;
+    let renderCount = 0;
+    renderShell = () => {
+      renderCount += 1;
+    };
+    updateContentPlanStream({ status: "streaming", label: "模型正在返回内容", text: "chunk" });
+    renderShell = originalRenderShell;
+    return renderCount;
+  })()
+`, sandbox);
+assert.strictEqual(streamingRenderCount, 0, "streaming content-plan chunks update state without rebuilding the whole app shell");
+const contentPlanStreamingLogHtml = vm.runInContext(`
+  renderContentPlanGenerationLog({
+    status: "streaming",
+    label: "模型正在返回内容",
+    text: "RAW_PROVIDER_CHUNK_SHOULD_NOT_REACH_DOM"
+  })
+`, sandbox);
+assert.ok(!contentPlanStreamingLogHtml.includes("RAW_PROVIDER_CHUNK_SHOULD_NOT_REACH_DOM"), "content-plan streaming raw chunks stay out of the DOM so storyboard scrolling is not disturbed");
+assert.ok(contentPlanStreamingLogHtml.includes("结果会在完成后写入内容规划框"), "content-plan streaming shows a compact stable status message");
+const offCreateDoneRenderCount = vm.runInContext(`
+  (() => {
+    const originalRenderShell = renderShell;
+    const originalView = view;
+    let renderCount = 0;
+    view = "settings";
+    renderShell = () => {
+      renderCount += 1;
+    };
+    updateContentPlanStream({ status: "done", label: "内容规划已生成", text: "后台生成已完成。" });
+    renderShell = originalRenderShell;
+    view = originalView;
+    return renderCount;
+  })()
+`, sandbox);
+assert.strictEqual(offCreateDoneRenderCount, 0, "completed content-plan streams do not redraw other modules while the user is away from create");
 vm.runInContext(
   `updateContentPlanStream({ status: "done", label: "内容规划已生成", text: "已收到模型返回，内容规划已写入下方编辑框。", rawText: "# 产品理解\\n最终规划全文" }); renderShell();`,
   sandbox
@@ -1052,7 +1096,17 @@ assert.deepStrictEqual(JSON.parse(JSON.stringify(createBatchResult)), {
 }, "create review entry creates multiple same-storyboard video tasks with selected strategy");
 
 sandbox.location.hash = "#reverse";
-vm.runInContext("view = initialView(); renderShell();", sandbox);
+vm.runInContext(`
+  Core.addProductImage(state.products[0], {
+    type: "url",
+    url: "https://example.test/reverse-product-front.png",
+    label: "反推二创主图",
+    role: "主图",
+    useForVideo: true
+  });
+  view = initialView();
+  renderShell();
+`, sandbox);
 assert.ok(appHtml.includes("视频反推分镜"), "reverse page renders title");
 assert.ok(appHtml.includes('data-file="reverse-video"'), "reverse page renders video upload input");
 assert.ok(appHtml.includes('data-field="reverseVideo.notes"'), "reverse page renders reverse notes input");
@@ -1063,6 +1117,9 @@ assert.ok(!appHtml.includes("产品名称"), "reverse page removes the duplicate
 assert.ok(!appHtml.includes('data-product-field="name"'), "reverse page no longer edits product name from the remix panel");
 assert.ok(appHtml.includes('data-product-field="imageUrl"'), "reverse page can edit selected product image URL");
 assert.ok(appHtml.includes('data-file="product-image"'), "reverse page can upload selected product image");
+assert.ok(appHtml.includes("产品参考图组"), "reverse page renders product reference image group for remix products");
+assert.ok(appHtml.includes('data-file="product-reference-images"'), "reverse page supports multi-image product uploads");
+assert.ok(appHtml.includes('data-product-image-field="useForVideo"'), "reverse page can choose which product references feed video generation");
 assert.ok(appHtml.includes('data-field="reverseVideo.secondaryCount"'), "reverse page renders editable secondary count");
 assert.ok(appHtml.includes('data-field="reverseVideo.creationStrategy"'), "reverse page renders editable creation strategy");
 assert.ok(appHtml.includes('data-action="reverse-storyboard"'), "reverse page exposes reverse storyboard action");

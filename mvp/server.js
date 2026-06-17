@@ -504,6 +504,12 @@ function isVideoUpload(contentType, filename) {
   return ["video/mp4", "video/quicktime", "video/webm"].includes(type) || [".mp4", ".mov", ".webm"].includes(ext);
 }
 
+function isImageUpload(contentType, filename) {
+  const type = String(contentType || "").split(";")[0].trim().toLowerCase();
+  const ext = path.extname(String(filename || "")).toLowerCase();
+  return ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"].includes(type) || [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext);
+}
+
 function uploadUrlToPath(urlPath) {
   const value = String(urlPath || "");
   if (!value.startsWith("/outputs/uploads/")) {
@@ -760,6 +766,37 @@ async function handleVideoUpload(req, res, url) {
       fileName,
       url: `/outputs/uploads/${uploadId}/${fileName}`,
       mimeType: String(contentType).split(";")[0] || types[path.extname(fileName)] || "video/mp4",
+      size: body.length,
+      uploadedAt: new Date().toISOString(),
+    };
+    sendJson(res, 200, { ok: true, upload });
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: error.message });
+  }
+}
+
+async function handleImageUpload(req, res, url) {
+  try {
+    const filename = safeName(url.searchParams.get("filename"), "product-image.png");
+    const contentType = req.headers["content-type"] || "";
+    if (!isImageUpload(contentType, filename)) {
+      throw new Error("请上传 png、jpg、jpeg、webp 或 gif 图片。");
+    }
+    const body = await readRawBody(req, 20 * 1024 * 1024);
+    if (!body.length) {
+      throw new Error("上传的图片为空。");
+    }
+    const uploadId = `upload_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const uploadDir = path.join(OUTPUTS_ROOT, "uploads", uploadId);
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const fileName = safeName(filename, `product-image${path.extname(filename) || ".png"}`);
+    const filePath = path.join(uploadDir, fileName);
+    fs.writeFileSync(filePath, body);
+    const upload = {
+      id: uploadId,
+      fileName,
+      url: `/outputs/uploads/${uploadId}/${fileName}`,
+      mimeType: String(contentType).split(";")[0] || types[path.extname(fileName)] || "image/png",
       size: body.length,
       uploadedAt: new Date().toISOString(),
     };
@@ -1168,6 +1205,10 @@ function createServer() {
     }
     if (req.method === "POST" && url.pathname === "/api/uploads/video") {
       handleVideoUpload(req, res, url);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/uploads/image") {
+      handleImageUpload(req, res, url);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/video/frames") {
