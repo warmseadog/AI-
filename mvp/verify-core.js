@@ -34,6 +34,28 @@ function userVisionParts(request) {
   return Array.isArray(message.content) ? message.content : [];
 }
 
+function videoRequestPrompt(request) {
+  if (request.body && request.body.prompt) return request.body.prompt;
+  const textPart = request.body && Array.isArray(request.body.content)
+    ? request.body.content.find((item) => item && item.type === "text")
+    : null;
+  return textPart ? textPart.text : "";
+}
+
+function videoRequestImageUrls(request) {
+  if (request.body && Array.isArray(request.body.image_urls)) return request.body.image_urls;
+  if (request.body && Array.isArray(request.body.content)) {
+    return request.body.content
+      .filter((item) => item && item.type === "image_url" && item.image_url && item.image_url.url)
+      .map((item) => item.image_url.url);
+  }
+  return [];
+}
+
+function videoRequestResolution(request) {
+  return request.body && (request.body.resolution || request.body.parameters && request.body.parameters.resolution);
+}
+
 const state = Core.createInitialState();
 assert.strictEqual(state.schemaVersion, 2, "initial state uses real-flow schema version");
 assert.deepStrictEqual(state.reverseVideo, {
@@ -54,7 +76,7 @@ assert.strictEqual(state.products[0].imageData, "", "default uploaded image star
 assert.deepStrictEqual(state.products[0].images, [], "default product starts with an empty reference image group");
 assert.strictEqual(state.contentBrief.seed, "", "default idea input starts empty");
 assert.strictEqual(state.contentBrief.text, "", "default generated plan text starts empty");
-assert.strictEqual(state.contentBrief.storyboardSceneCount, "auto", "default storyboard scene count is automatic");
+assert.strictEqual(state.contentBrief.storyboardSceneCount, "6", "default storyboard scene count is 6 scenes");
 assert.strictEqual(state.contentBrief.storyboardDetailLevel, "detailed", "default storyboard detail level asks for detailed scenes");
 assert.strictEqual(state.contentBrief.videoResolution, "720p", "default video resolution is 720p");
 assert.deepStrictEqual(state.favorites, [], "default state has no seeded favorites");
@@ -65,6 +87,9 @@ assert.strictEqual(state.integrations.llm.provider, "custom-llm", "LLM defaults 
 assert.strictEqual(state.integrations.llm.model, "gpt-5.5", "LLM defaults to GPT-5.5");
 assert.strictEqual(state.integrations.llm.endpoint, "https://toapis.com/v1/chat/completions", "LLM defaults to the GPT-5.5 ToAPIs chat endpoint");
 assert.strictEqual(state.integrations.video.mode, "http", "video defaults to real HTTP mode");
+assert.strictEqual(state.integrations.video.provider, "jimeng-seedance-official", "video defaults to the official Jimeng/Seedance provider");
+assert.strictEqual(state.integrations.video.apiStyle, "jimeng-seedance-official", "video defaults to the official Jimeng API style");
+assert.ok(state.integrations.video.endpoint.includes("/api/v3/contents/generations/tasks"), "official Jimeng endpoint uses the Ark content generation task API");
 assert.strictEqual(state.integrations.publisher.mode, "http", "publisher defaults to real HTTP mode");
 assert.deepStrictEqual(state.selectedPlatforms, ["tiktok"], "default publishing platform is TikTok only");
 assert.deepStrictEqual(Core.publishPlatforms.map((platform) => platform.id), ["tiktok"], "enabled publishing platforms are limited to TikTok");
@@ -83,6 +108,37 @@ const timeoutIssue = Core.explainProviderIssue({
 });
 assert.strictEqual(timeoutIssue.title, "接口超时", "Cloudflare timeout errors get an operator-readable title");
 assert.ok(timeoutIssue.action.includes("稍后重试"), "timeout errors tell the operator to retry later");
+
+const modelNotOpenIssue = Core.explainProviderIssue({
+  ok: false,
+  upstream: {
+    status: 404,
+    data: {
+      error: {
+        code: "ModelNotOpen",
+        message: "Your account 2108982600 has not activated the model doubao-seedance-2-0-260128. Please activate the model service in the Ark Console.",
+      },
+    },
+  },
+}, { kind: "video" });
+assert.strictEqual(modelNotOpenIssue.title, "模型未开通", "unactivated model errors get a precise operator-readable title");
+assert.ok(modelNotOpenIssue.action.includes("开通") || modelNotOpenIssue.action.includes("切换"), "unactivated model errors explain activation or switching");
+
+const invalidRatioIssue = Core.explainProviderIssue({
+  ok: false,
+  upstream: {
+    status: 200,
+    data: {
+      status: "failed",
+      error: {
+        code: "InvalidParameter.BodyFormat",
+        message: "Invalid ratio: Request id: 02178168439790500000000000000000000ffffac193aff237c9b",
+      },
+    },
+  },
+}, { kind: "video" });
+assert.strictEqual(invalidRatioIssue.title, "请求参数格式错误", "invalid ratio errors get a precise operator-readable title");
+assert.ok(invalidRatioIssue.action.includes("比例") && invalidRatioIssue.action.includes("重新生成"), "invalid ratio errors explain ratio config and regeneration");
 
 const emptyModelIssue = Core.explainProviderIssue({
   ok: false,
@@ -162,12 +218,28 @@ assert.ok(JSON.stringify(planRequest.body).includes("至少 80%"), "content plan
 assert.ok(JSON.stringify(planRequest.body).includes("不允许整段英文输出"), "content plan request rejects English-only sections");
 assert.strictEqual(planPayload.duration, 15, "content plan request asks for 15 second plan");
 assert.strictEqual(planPayload.ratio, "9:16", "content plan request asks for vertical video");
+assert.deepStrictEqual(planPayload.outputFields, ["keySellingPoints", "mainPainPoint", "videoThroughline", "mustShow", "mustAvoid"], "content plan request only asks for a concise storyboard pre-brief");
+assert.ok(JSON.stringify(planRequest.body).includes("300-500"), "content plan prompt limits the generated plan length");
 assert.ok(!planPayload.outputFields.includes("scenes"), "content plan request does not ask for scenes");
 assert.ok(!planPayload.outputFields.includes("videoPrompt"), "content plan request does not ask for video prompts");
-assert.ok(planPayload.outputFields.includes("painPoints"), "content plan request asks for pain points");
+assert.ok(planPayload.outputFields.includes("mainPainPoint"), "content plan request asks for one main pain point");
 assert.ok(planPayload.outputFields.includes("mustShow"), "content plan request asks for must-show visual requirements");
+assert.ok(!planPayload.outputFields.includes("targetAudience"), "content plan request no longer asks for long target audience sections");
+assert.ok(!planPayload.outputFields.includes("usageScenarios"), "content plan request no longer asks for long usage scenario sections");
+assert.ok(!planPayload.outputFields.includes("cta"), "content plan request no longer asks for CTA sections");
 assert.ok(!planPayload.outputFields.includes("storyboardGuidance"), "content plan request does not ask for storyboard guidance");
 assertNoDemoWaterText(planRequest, "content plan request");
+
+const directStoryboardRequest = Core.buildStoryboardFromIdeaProviderRequest(state);
+const directStoryboardPayload = userMessagePayload(directStoryboardRequest);
+assert.strictEqual(directStoryboardRequest.provider, state.integrations.llm.provider, "direct storyboard request uses configured LLM provider");
+assert.strictEqual(directStoryboardPayload.idea, state.contentBrief.seed, "direct storyboard request includes user idea");
+assert.strictEqual(directStoryboardPayload.materials.length, 1, "direct storyboard request includes product image material");
+assert.strictEqual(directStoryboardPayload.sceneCount, 6, "direct storyboard request defaults to 6 scenes");
+assert.strictEqual(directStoryboardPayload.duration, 15, "direct storyboard request targets 15 seconds");
+assert.ok(directStoryboardPayload.outputFields.includes("videoPrompt"), "direct storyboard request asks for video prompts");
+assert.ok(!JSON.stringify(directStoryboardRequest.body).includes("contentPlan"), "direct storyboard request does not ask for or send contentPlan");
+assert.ok(!JSON.stringify(directStoryboardRequest.body).includes("跨境电商短视频分镜前置摘要助手"), "direct storyboard request does not use the content-plan prebrief prompt");
 
 const imageGroupState = Core.createInitialState();
 const imageGroupProduct = imageGroupState.products[0];
@@ -188,19 +260,30 @@ Core.addProductImage(imageGroupProduct, {
   useForVideo: true,
 });
 Core.addProductImage(imageGroupProduct, {
+  type: "hosted",
+  url: "/outputs/uploads/upload_public/top.png",
+  publicUrl: "https://cdn.example.test/uploads/upload_public/top.png",
+  label: "公网托管顶视图",
+  role: "细节",
+  priority: 3,
+  useForVideo: true,
+});
+Core.addProductImage(imageGroupProduct, {
   type: "upload",
   dataUrl: "data:image/png;base64,SCENE",
   label: "场景参考",
   role: "场景",
-  priority: 3,
+  priority: 4,
   useForVideo: false,
 });
 imageGroupState.contentBrief.seed = "我想做一条展示产品多角度细节的短视频。";
 const imageGroupPlanRequest = Core.buildContentPlanProviderRequest(imageGroupState);
 const imageGroupPlanPayload = userMessagePayload(imageGroupPlanRequest);
-assert.strictEqual(imageGroupPlanPayload.materials.length, 3, "content plan request accepts multiple product reference images");
-assert.deepStrictEqual(imageGroupPlanPayload.materials.map((item) => item.role), ["主图", "侧面", "场景"], "content plan materials preserve reference image roles");
-assert.strictEqual(imageGroupPlanPayload.materials[2].useForVideo, false, "content plan materials preserve scene-only image usage");
+assert.strictEqual(imageGroupPlanPayload.materials.length, 4, "content plan request accepts multiple product reference images");
+assert.deepStrictEqual(imageGroupPlanPayload.materials.map((item) => item.role), ["主图", "侧面", "细节", "场景图"], "content plan materials preserve reference image roles");
+assert.strictEqual(imageGroupPlanPayload.materials[2].publicUrl, "https://cdn.example.test/uploads/upload_public/top.png", "content plan materials keep hosted public URLs");
+assert.strictEqual(imageGroupPlanPayload.materials[2].modelVisible, true, "content plan materials keep hosted model-visible status");
+assert.strictEqual(imageGroupPlanPayload.materials[3].useForVideo, false, "content plan materials preserve scene-only image usage");
 
 const imageGroupTask = Core.createContentPlanTask(imageGroupState, {
   contentPlan: {
@@ -212,6 +295,8 @@ const imageGroupTask = Core.createContentPlanTask(imageGroupState, {
     hook: "Look at the details",
   },
 });
+assert.strictEqual(imageGroupTask.contentPlanSeed, imageGroupState.contentBrief.seed, "content plan task records the idea seed used for generation");
+assert.strictEqual(imageGroupTask.contentBrief.seed, imageGroupState.contentBrief.seed, "content plan task content brief keeps the idea seed snapshot");
 imageGroupTask.storyboard = Core.normalizeStoryboardTiming([
   {
     time: "0-15s",
@@ -231,14 +316,277 @@ Object.assign(imageGroupState.integrations.video, {
   apiKey: "toapis-key",
 });
 const imageGroupVideoRequest = Core.buildVideoProviderRequest(imageGroupState, imageGroupTask, imageGroupProduct);
-assert.deepStrictEqual(imageGroupVideoRequest.body.image_urls, ["https://example.test/front.png", "https://example.test/side.png"], "ToAPIs video request sends video-enabled product reference URLs in priority order");
+assert.deepStrictEqual(imageGroupVideoRequest.body.image_urls, ["https://example.test/front.png", "https://example.test/side.png", "https://cdn.example.test/uploads/upload_public/top.png"], "ToAPIs video request sends video-enabled product reference URLs in priority order");
 assert.strictEqual(imageGroupVideoRequest.body.resolution, "720p", "ToAPIs video request sends lowercase resolution values accepted by the upstream API");
 assert.ok(imageGroupVideoRequest.body.prompt.includes("正面主图"), "video prompt names the primary product reference");
 assert.ok(imageGroupVideoRequest.body.prompt.includes("侧面结构"), "video prompt names secondary product references");
+assert.ok(imageGroupVideoRequest.body.prompt.includes("公网托管顶视图"), "video prompt names hosted product references");
 assert.ok(imageGroupVideoRequest.body.prompt.includes("场景图只参考使用环境"), "video prompt keeps scene references from changing product identity");
+
+const localOnlyImageState = Core.createInitialState();
+const localOnlyImageProduct = localOnlyImageState.products[0];
+Core.addProductImage(localOnlyImageProduct, {
+  type: "upload",
+  url: "/outputs/uploads/local-only.png",
+  dataUrl: "data:image/png;base64,LOCALONLY",
+  label: "本地上传产品图",
+  role: "主图",
+  useForVideo: true,
+});
+Object.assign(localOnlyImageState.integrations.video, {
+  mode: "http",
+  provider: "toapis-seedance",
+  apiStyle: "toapis-video",
+  endpoint: "https://toapis.com/v1/videos/generations",
+  statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+  model: "seedance-2-fast",
+  apiKey: "toapis-key",
+});
+const localOnlyImageTask = {
+  id: "task-local-only-image",
+  productId: localOnlyImageProduct.id,
+  duration: 15,
+  ratio: "9:16",
+  storyboard: Core.normalizeStoryboardTiming([{
+    time: "0-15s",
+    title: "产品展示",
+    videoPrompt: "Show the product clearly.",
+  }], 15),
+};
+assert.throws(
+  () => Core.buildVideoProviderRequest(localOnlyImageState, localOnlyImageTask, localOnlyImageProduct),
+  /模型无法接收产品图.*公网 HTTPS 图片链接/,
+  "video generation fails before provider call when product images have no model-visible HTTPS URL"
+);
+assert.throws(
+  () => Core.simulateVideoGeneration(localOnlyImageState, localOnlyImageTask),
+  /模型无法接收产品图.*公网 HTTPS 图片链接/,
+  "simulateVideoGeneration returns a failed task when the model would not receive product images"
+);
+assert.strictEqual(localOnlyImageTask.status, "rejected", "local-only product image failure marks the task rejected");
+assert.ok(localOnlyImageTask.reviewNote.includes("公网 HTTPS 图片链接"), "local-only product image failure stores operator-readable guidance");
+assert.strictEqual(localOnlyImageTask.providerResponses.video.ok, false, "local-only product image failure stores failed provider response");
+
+const mixedLocalAndPublicImageState = Core.createInitialState();
+const mixedLocalAndPublicImageProduct = mixedLocalAndPublicImageState.products[0];
+Core.addProductImage(mixedLocalAndPublicImageProduct, {
+  type: "upload",
+  url: "/outputs/uploads/local-only.png",
+  dataUrl: "data:image/png;base64,LOCALONLY",
+  label: "本地上传产品图",
+  role: "主图",
+  useForVideo: true,
+});
+mixedLocalAndPublicImageProduct.imageUrl = "https://i.ibb.co/demo/public-product.png";
+Object.assign(mixedLocalAndPublicImageState.integrations.video, {
+  mode: "http",
+  provider: "toapis-seedance",
+  apiStyle: "toapis-video",
+  endpoint: "https://toapis.com/v1/videos/generations",
+  statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+  model: "seedance-2-fast",
+  apiKey: "toapis-key",
+});
+const mixedLocalAndPublicImageTask = {
+  id: "task-mixed-local-public-image",
+  productId: mixedLocalAndPublicImageProduct.id,
+  duration: 15,
+  ratio: "9:16",
+  storyboard: Core.normalizeStoryboardTiming([{
+    time: "0-15s",
+    title: "产品展示",
+    videoPrompt: "Show the product clearly.",
+  }], 15),
+};
+const mixedLocalAndPublicImageRequest = Core.buildVideoProviderRequest(mixedLocalAndPublicImageState, mixedLocalAndPublicImageTask, mixedLocalAndPublicImageProduct);
+assert.deepStrictEqual(
+  mixedLocalAndPublicImageRequest.body.image_urls,
+  ["https://i.ibb.co/demo/public-product.png"],
+  "video generation uses the manually entered public product image URL even when local uploads also exist"
+);
 
 const toapisPreset = Core.videoProviders.find((provider) => provider.id === "toapis-seedance");
 assert.strictEqual(toapisPreset.name, "Seedance 2 / ToAPIs", "ToAPIs provider label covers standard and fast profiles");
+
+assert.deepStrictEqual(
+  Core.productImageRoles,
+  ["主图", "正面", "侧面", "背面", "45 度", "细节", "场景图"],
+  "product reference roles follow the recommended 5-7 image structure"
+);
+
+const officialJimengPreset = Core.videoProviders.find((provider) => provider.id === "jimeng-seedance-official");
+assert.ok(officialJimengPreset, "official Jimeng/Seedance provider preset exists");
+assert.strictEqual(officialJimengPreset.apiStyle, "jimeng-seedance-official", "official Jimeng preset uses its own API style");
+assert.ok(officialJimengPreset.endpoint.includes("/api/v3/contents/generations/tasks"), "official Jimeng preset points at the content generation task endpoint");
+
+const officialState = Core.createInitialState();
+const officialProduct = officialState.products[0];
+Core.productImageRoles.forEach((role, index) => {
+  Core.addProductImage(officialProduct, {
+    type: "url",
+    url: `https://example.test/product-${index + 1}.png`,
+    label: `${role}参考`,
+    role,
+    priority: index + 1,
+    useForVideo: role !== "场景图",
+  });
+});
+const skippedImage = Core.addProductImage(officialProduct, {
+  type: "url",
+  url: "https://example.test/skipped.png",
+  label: "禁用参考",
+  role: "细节",
+  priority: 8,
+  useForVideo: false,
+});
+const officialTask = Core.createContentPlanTask(officialState, {
+  contentPlan: {
+    productUnderstanding: "多参考图产品。",
+    targetAudience: "TikTok 美国用户。",
+    keySellingPoints: ["多角度稳定展示"],
+    usageScenarios: ["台面展示"],
+    strategy: "稳定展示产品外观。",
+    hook: "Keep the product consistent",
+  },
+});
+officialTask.storyboard = Core.normalizeStoryboardTiming([
+  {
+    time: "0-15s",
+    title: "稳定展示",
+    visual: "固定机位展示产品。",
+    subtitle: "Same product, every frame.",
+    videoPrompt: "stable product showcase with fixed camera.",
+  },
+], 15);
+const officialVideoRequest = Core.buildVideoProviderRequest(officialState, officialTask, officialProduct);
+assert.strictEqual(officialVideoRequest.apiStyle, "jimeng-seedance-official", "official Jimeng request keeps its API style");
+assert.strictEqual(officialVideoRequest.body.model, officialState.integrations.video.model, "official Jimeng request includes the configured model");
+assert.strictEqual(officialVideoRequest.body.content[0].type, "text", "official Jimeng request sends prompt as the first content item");
+assert.ok(!("role" in officialVideoRequest.body.content[0]), "official Jimeng text content does not include a role");
+assert.strictEqual(officialVideoRequest.body.content.filter((item) => item.type === "image_url").length, 6, "official Jimeng request sends only video-enabled reference images");
+assert.ok(officialVideoRequest.body.content.filter((item) => item.type === "image_url").every((item) => item.role === "reference_image"), "official Jimeng image contents use the official multimodal reference role");
+assert.ok(!JSON.stringify(officialVideoRequest.body).includes(skippedImage.url), "official Jimeng request excludes images disabled for video");
+assert.ok(officialVideoRequest.body.content.some((item) => item.image_url && item.image_url.url === "https://example.test/product-1.png"), "official Jimeng request sends the primary product image URL");
+assert.strictEqual(officialVideoRequest.body.ratio, "9:16", "official Jimeng request sends the ratio field at the top level");
+assert.ok(!("aspect_ratio" in officialVideoRequest.body), "official Jimeng request does not send the ToAPIs aspect_ratio field");
+assert.strictEqual(officialVideoRequest.body.resolution, "720p", "official Jimeng request uses the configured video resolution at the top level");
+assert.strictEqual(officialVideoRequest.body.duration, 15, "official Jimeng request sends the 15 second duration at the top level for Ark");
+assert.strictEqual(officialVideoRequest.body.watermark, false, "official Jimeng request disables watermark at the top level");
+assert.strictEqual(officialVideoRequest.body.camera_fixed, false, "official Jimeng request sends full camera_fixed field at the top level");
+
+const officialLocalImageState = Core.createInitialState();
+const officialLocalImageProduct = officialLocalImageState.products[0];
+Core.addProductImage(officialLocalImageProduct, {
+  type: "hosted",
+  url: "/outputs/uploads/upload_real/product.png",
+  publicUrl: "https://i.ibb.co/unreachable/product.png",
+  label: "本地上传主图",
+  role: "主图",
+  priority: 1,
+  useForVideo: true,
+});
+const officialLocalImageTask = {
+  id: "official-local-image-fallback",
+  productId: officialLocalImageProduct.id,
+  duration: 15,
+  ratio: "9:16",
+  storyboard: Core.normalizeStoryboardTiming([{
+    time: "0-15s",
+    title: "产品展示",
+    videoPrompt: "Show the product clearly.",
+  }], 15),
+};
+const officialLocalImageRequest = Core.buildVideoProviderRequest(officialLocalImageState, officialLocalImageTask, officialLocalImageProduct);
+const officialLocalImageContent = officialLocalImageRequest.body.content.find((item) => item.type === "image_url");
+assert.strictEqual(officialLocalImageContent.image_url.url, "https://i.ibb.co/unreachable/product.png", "official Jimeng request keeps the hosted URL for traceability");
+assert.strictEqual(officialLocalImageContent.image_url.local_url, "/outputs/uploads/upload_real/product.png", "official Jimeng request includes local upload fallback for server-side inlining");
+
+const officialInlineImageState = Core.createInitialState();
+const officialInlineImageProduct = officialInlineImageState.products[0];
+Core.addProductImage(officialInlineImageProduct, {
+  type: "upload",
+  dataUrl: "data:image/png;base64,INLINE",
+  label: "浏览器内联主图",
+  role: "主图",
+  priority: 1,
+  useForVideo: true,
+});
+const officialInlineImageRequest = Core.buildVideoProviderRequest(officialInlineImageState, officialLocalImageTask, officialInlineImageProduct);
+const officialInlineImageContent = officialInlineImageRequest.body.content.find((item) => item.type === "image_url");
+assert.strictEqual(officialInlineImageContent.image_url.url, "data:image/png;base64,INLINE", "official Jimeng can use base64 image input directly");
+
+const fractionalOfficialTask = Object.assign({}, officialTask, {
+  id: "official-fractional-duration",
+  duration: 13.1,
+  storyboard: [
+    {
+      time: "0-13.1s",
+      title: "非整数时长",
+      visual: "按参考内容生成 13.1 秒脚本。",
+      subtitle: "Almost fifteen.",
+      videoPrompt: "fractional duration source storyboard.",
+    },
+  ],
+});
+const fractionalOfficialVideoRequest = Core.buildVideoProviderRequest(officialState, fractionalOfficialTask, officialProduct);
+assert.strictEqual(fractionalOfficialVideoRequest.body.duration, 15, "official Jimeng top-level duration is normalized to 15 seconds");
+assert.ok(videoRequestPrompt(fractionalOfficialVideoRequest).includes("Target duration: exactly 15s"), "official Jimeng prompt uses 15 second duration");
+assert.strictEqual(fractionalOfficialTask.duration, 15, "official Jimeng task duration is normalized to 15 seconds");
+
+officialTask.video = { jobId: "cgt-20260617164434-jszfc" };
+officialTask.providerRequests = { video: officialVideoRequest };
+Object.assign(officialState.integrations.video, {
+  provider: "toapis-seedance",
+  apiStyle: "toapis-video",
+  endpoint: "https://toapis.com/v1/videos/generations",
+  statusEndpoint: "https://toapis.com/v1/videos/generations/{task_id}",
+  model: "vidu/q3-turbo",
+});
+const officialStatusRequest = Core.buildVideoStatusProviderRequest(officialState, officialTask);
+assert.strictEqual(officialStatusRequest.apiStyle, "jimeng-seedance-official", "video status query keeps the generation provider API style");
+assert.ok(officialStatusRequest.endpoint.includes("ark.cn-beijing.volces.com"), "video status query uses the generation provider status endpoint");
+assert.ok(!officialStatusRequest.endpoint.includes("toapis.com"), "video status query does not use a later global provider switch");
+assert.strictEqual(officialStatusRequest.expectedDuration, 15, "official Jimeng status query carries the submitted 15 second duration");
+
+function buildVideoResolutionRequest(apiStyle, resolution) {
+  const resolutionState = Core.createInitialState();
+  Object.assign(resolutionState.integrations.video, {
+    provider: apiStyle === "jimeng-seedance-official" ? "jimeng-seedance-official" : "toapis-seedance",
+    apiStyle,
+    mode: "http",
+    apiKey: "video-key",
+    endpoint: "https://example.test/video",
+    statusEndpoint: "https://example.test/video/{task_id}",
+    model: apiStyle === "jimeng-seedance-official" ? "doubao-seedance-2-0-260128" : "vidu/q3",
+  });
+  resolutionState.contentBrief.videoResolution = resolution;
+  const product = resolutionState.products[0];
+  product.imageUrl = "https://example.test/product.png";
+  const task = {
+    id: `task_${String(resolution).replace(/[^a-z0-9]/gi, "_")}`,
+    duration: 15,
+    ratio: "9:16",
+    videoResolution: resolution,
+    storyboard: [
+      { time: "0:00-0:03", title: "Hook", visual: "Show product", subtitle: "Cool down fast" },
+    ],
+    contentBrief: { videoResolution: resolution },
+  };
+  return Core.buildVideoProviderRequest(resolutionState, task, product);
+}
+
+["480p", "720p", "1080p"].forEach((resolution) => {
+  const request = buildVideoResolutionRequest("toapis-video", resolution);
+  assert.strictEqual(request.body.resolution, resolution, `ToAPIs video request keeps ${resolution} lowercase`);
+});
+
+["480p", "720p", "1080p"].forEach((resolution) => {
+  const request = buildVideoResolutionRequest("jimeng-seedance-official", resolution);
+  assert.strictEqual(request.body.resolution, resolution, `official Jimeng request keeps ${resolution} lowercase`);
+});
+
+assert.strictEqual(buildVideoResolutionRequest("toapis-video", "480P").body.resolution, "480p", "ToAPIs normalizes uppercase 480P");
+assert.strictEqual(buildVideoResolutionRequest("jimeng-seedance-official", "bad-value").body.resolution, "720p", "official Jimeng falls back invalid resolution to 720p");
 
 const created = Core.createContentPlanTask(state, {
   contentPlan: {
@@ -296,13 +644,14 @@ assert.ok(objectListTask.contentPlan.painPoints[0].includes("夏天排队太热"
 
 const randomImageNameState = Core.createInitialState();
 const randomImageProduct = randomImageNameState.products[0];
+randomImageProduct.imageUrl = "https://example.test/uploaded-product.png";
 randomImageProduct.imageData = "data:image/png;base64,AAA";
 randomImageProduct.imageLabel = "IMG_8F3A92C7";
 randomImageNameState.contentBrief.seed = "我想做一条净饮机短视频，突出厨房场景。";
 const randomImagePlanRequest = Core.buildContentPlanProviderRequest(randomImageNameState);
 const randomImagePlanPayload = userMessagePayload(randomImagePlanRequest);
 const randomImageNeedle = "IMG_8F3A92C7";
-assert.strictEqual(randomImagePlanPayload.materials[0].label, "上传产品图", "uploaded image material uses a generic label when product name is blank");
+assert.ok(randomImagePlanPayload.materials.some((material) => material.label === "上传产品图"), "uploaded image material uses a generic label when product name is blank");
 assert.ok(!JSON.stringify(randomImagePlanRequest).includes(randomImageNeedle), "content plan request does not leak random image filenames");
 const randomImageTask = Core.createContentPlanTask(randomImageNameState, {
   contentPlan: {
@@ -364,7 +713,7 @@ const storyboardFromPlanPayload = userMessagePayload(storyboardFromPlanRequest);
 assert.strictEqual(storyboardFromPlanPayload.contentPlan.strategy, created.contentPlan.strategy, "storyboard request uses the edited content plan strategy");
 assert.strictEqual(storyboardFromPlanPayload.contentPlan.storyboardGuidance, created.contentPlan.storyboardGuidance, "storyboard request uses edited storyboard guidance");
 assert.strictEqual(storyboardFromPlanPayload.contentPlanText, created.contentPlanText, "storyboard request includes the single edited Chinese content plan box");
-assert.strictEqual(storyboardFromPlanPayload.sceneCount, 8, "auto scene count defaults to 8 scenes for a 15 second content plan");
+assert.strictEqual(storyboardFromPlanPayload.sceneCount, 6, "auto scene count defaults to 6 scenes for a 15 second content plan");
 assert.strictEqual(storyboardFromPlanPayload.detailLevel, "dense", "storyboard request includes selected detail level");
 assert.strictEqual(storyboardFromPlanPayload.outputLanguage.language, "zh-CN", "storyboard request requires readable Chinese output");
 assert.ok(JSON.stringify(storyboardFromPlanRequest.body).includes("所有面向运营审核的可读字段必须使用简体中文"), "storyboard system prompt requires Chinese readable fields");
@@ -487,8 +836,22 @@ assert.strictEqual(contentPlanVideoTasks[0].storyboard[0].title, created.storybo
 assert.notStrictEqual(contentPlanVideoTasks[0].storyboard, created.storyboard, "content plan video variants clone storyboard arrays");
 assert.ok(contentPlanVideoTasks[1].videoStyleInstruction.includes("平台风格"), "content plan video variants carry style instructions into video generation");
 assert.strictEqual(state.selectedTaskId, contentPlanVideoTasks[0].id, "first generated video variant becomes selected");
+contentPlanVideoTasks[1].storyboard[0] = Object.assign({}, contentPlanVideoTasks[1].storyboard[0], {
+  subtitle: "Too hot?",
+  voiceover: "夏天通勤很热。",
+  screenText: "免手持降温",
+  productFocus: "产品必须清晰佩戴在脖子上",
+  reviewChecklist: ["产品是否完整露出"],
+  riskNotes: ["不承诺具体降温度数"],
+});
 const contentPlanVideoRequest = Core.buildVideoProviderRequest(state, contentPlanVideoTasks[1], state.products[0]);
-assert.ok(contentPlanVideoRequest.body.prompt.includes("平台风格"), "video provider prompt includes the selected variant style");
+assert.ok(videoRequestPrompt(contentPlanVideoRequest).includes("平台风格"), "video provider prompt includes the selected variant style");
+assert.ok(videoRequestPrompt(contentPlanVideoRequest).includes("产品必须清晰佩戴在脖子上"), "video provider prompt keeps lightweight product focus guidance");
+assert.ok(!videoRequestPrompt(contentPlanVideoRequest).includes("字幕："), "video provider prompt excludes audience subtitle metadata for normal storyboards");
+assert.ok(!videoRequestPrompt(contentPlanVideoRequest).includes("旁白："), "video provider prompt excludes voiceover metadata for normal storyboards");
+assert.ok(!videoRequestPrompt(contentPlanVideoRequest).includes("屏幕字："), "video provider prompt excludes screen text metadata for normal storyboards");
+assert.ok(!videoRequestPrompt(contentPlanVideoRequest).includes("审核点"), "video provider prompt excludes review checklist metadata");
+assert.ok(!videoRequestPrompt(contentPlanVideoRequest).includes("风险提示"), "video provider prompt excludes risk note metadata");
 state.tasks = tasksBeforeContentPlanVideoBatch;
 state.selectedTaskId = selectedBeforeContentPlanVideoBatch;
 
@@ -911,15 +1274,15 @@ assert.strictEqual(reverseCreatedTasksFromState[0].productName, "可折叠挂脖
 assert.ok(reverseCreatedTasksFromState[0].contentBrief.productPromise.includes("免手持"), "reverse secondary task content brief includes selected product selling points");
 assert.strictEqual(reverseCreatedTasksFromState[0].videoResolution, "480p", "secondary task records the selected video resolution");
 const reverseVideoProviderRequest = Core.buildVideoProviderRequest(state, reverseCreatedTasksFromState[0], Core.getById(state.products, "product-neck-fan-target"));
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("可折叠挂脖风扇"), "reverse video prompt includes selected product name");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("免手持"), "reverse video prompt includes selected product facts");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("最大程度复刻参考视频"), "reverse video prompt preserves the source video style");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("旁白"), "reverse video prompt includes voiceover guidance");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("产品参考图为最高优先级"), "reverse video prompt locks the selected product reference image");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("不得改变产品颜色、外观轮廓、比例、材质和关键结构"), "reverse video prompt forbids product appearance drift");
-assert.deepStrictEqual(reverseVideoProviderRequest.body.image_urls, ["https://example.test/target-neck-fan-front.png", "https://example.test/target-neck-fan-side.png"], "reverse video request uses the selected product reference image group");
-assert.ok(reverseVideoProviderRequest.body.prompt.includes("挂脖风扇侧面"), "reverse video prompt includes secondary product reference labels");
-assert.strictEqual(reverseVideoProviderRequest.body.resolution, "480p", "ToAPIS video request uses the selected resolution");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("可折叠挂脖风扇"), "reverse video prompt includes selected product name");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("免手持"), "reverse video prompt includes selected product facts");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("最大程度复刻参考视频"), "reverse video prompt preserves the source video style");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("旁白"), "reverse video prompt includes voiceover guidance");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("产品参考图为最高优先级"), "reverse video prompt locks the selected product reference image");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("不得改变产品颜色、外观轮廓、比例、材质和关键结构"), "reverse video prompt forbids product appearance drift");
+assert.deepStrictEqual(videoRequestImageUrls(reverseVideoProviderRequest), ["https://example.test/target-neck-fan-front.png", "https://example.test/target-neck-fan-side.png"], "reverse video request uses the selected product reference image group");
+assert.ok(videoRequestPrompt(reverseVideoProviderRequest).includes("挂脖风扇侧面"), "reverse video prompt includes secondary product reference labels");
+assert.strictEqual(videoRequestResolution(reverseVideoProviderRequest), "480p", "video request uses the selected resolution");
 
 const waterPurifierRequest = Core.buildVideoProviderRequest(
   state,
@@ -937,9 +1300,9 @@ const waterPurifierRequest = Core.buildVideoProviderRequest(
     detailsSaved: true,
   }
 );
-assert.ok(waterPurifierRequest.body.prompt.includes("乳白色圆角机身"), "water purifier prompt locks the cream rounded body");
-assert.ok(waterPurifierRequest.body.prompt.includes("黑色半透明水箱/侧面面板"), "water purifier prompt locks the black translucent tank panel");
-assert.ok(waterPurifierRequest.body.prompt.includes("Aigerri 标识"), "water purifier prompt locks the brand mark");
+assert.ok(videoRequestPrompt(waterPurifierRequest).includes("乳白色圆角机身"), "water purifier prompt locks the cream rounded body");
+assert.ok(videoRequestPrompt(waterPurifierRequest).includes("黑色半透明水箱/侧面面板"), "water purifier prompt locks the black translucent tank panel");
+assert.ok(videoRequestPrompt(waterPurifierRequest).includes("Aigerri 标识"), "water purifier prompt locks the brand mark");
 
 const reverseCreatedTasks = Core.createTasksFromReverseFavorite(state, { count: 2, strategy: "rewrite" });
 assert.strictEqual(reverseCreatedTasks.length, 2, "reverse favorite can create secondary tasks");
@@ -949,8 +1312,8 @@ assert.strictEqual(reverseCreatedTasks[0].storyboard[0].title, "结果前置", "
 
 Core.simulateVideoGeneration(state, created);
 assert.strictEqual(created.status, "video_generating", "real HTTP video generation enters generating state");
-assert.ok(created.providerRequests.video.body.prompt.includes("Target duration: exactly 15s"), "video request includes exact 15 second duration instruction");
-assert.ok(created.providerRequests.video.body.prompt.includes("0-15s"), "video request includes repaired full-length content plan scene prompt");
+assert.ok(videoRequestPrompt(created.providerRequests.video).includes("Target duration: exactly 15s"), "video request includes exact 15 second duration instruction");
+assert.ok(videoRequestPrompt(created.providerRequests.video).includes("0-15s"), "video request includes repaired full-length content plan scene prompt");
 
 Core.applyVideoProviderResult(created, {
   upstream: {
@@ -964,6 +1327,129 @@ Core.applyVideoProviderResult(created, {
 });
 assert.strictEqual(created.video.url, "https://example.test/generated.mp4", "video URL is stored from provider response");
 assert.strictEqual(created.status, "video_review", "successful video enters review");
+
+const officialVideoTask = {
+  id: "official-video-task",
+  status: "video_generating",
+  video: {},
+};
+Core.applyVideoProviderResult(officialVideoTask, {
+  upstream: {
+    data: {
+      id: "cgt-20260617164434-jszfc",
+      model: "doubao-seedance-2-0-260128",
+      status: "succeeded",
+      content: {
+        video_url: "https://example.test/official-seedance.mp4",
+      },
+      ratio: "9:16",
+      resolution: "720p",
+    },
+  },
+});
+assert.strictEqual(
+  officialVideoTask.video.url,
+  "https://example.test/official-seedance.mp4",
+  "official Jimeng content.video_url is stored from provider response"
+);
+assert.strictEqual(officialVideoTask.status, "video_review", "official Jimeng success enters video review");
+
+const migratedNoJobVideoState = Core.migrateState({
+  ...Core.createInitialState(),
+  tasks: [{
+    id: "missing-video-job",
+    title: "净饮机 · 无任务 ID",
+    productName: "净饮机",
+    status: "video_generating",
+    storyboard: [{ time: "0-15s", title: "产品展示", visual: "展示净饮机", subtitle: "Clean water", videoPrompt: "product video" }],
+    video: { url: "", providerStatus: "PENDING" },
+    providerRequests: { video: { endpoint: "https://example.test/videos" } },
+    providerResponses: {},
+  }],
+});
+assert.strictEqual(
+  migratedNoJobVideoState.tasks[0].status,
+  "storyboard_ready",
+  "saved generating video tasks without a job id are restored to storyboard-ready so they can be resubmitted"
+);
+assert.ok(
+  migratedNoJobVideoState.tasks[0].reviewNote.includes("视频任务 ID"),
+  "repaired missing-job video task explains why it needs resubmission"
+);
+
+const migratedRejectedNoJobVideoState = Core.migrateState({
+  ...Core.createInitialState(),
+  tasks: [{
+    id: "rejected-missing-video-job",
+    title: "净饮机 · 已保存分镜",
+    productName: "净饮机",
+    status: "rejected",
+    reviewNote: Core.missingVideoJobMessage ? Core.missingVideoJobMessage() : "视频任务已进入生成中，但本地没有保存视频任务 ID，无法查询视频结果。请重新生成视频。",
+    storyboard: [{ time: "0-15s", title: "产品展示", visual: "展示净饮机", subtitle: "Clean water", videoPrompt: "product video" }],
+    video: { url: "", providerStatus: "PENDING" },
+    providerRequests: { video: { endpoint: "https://example.test/videos" } },
+    providerResponses: {},
+  }],
+});
+assert.strictEqual(
+  migratedRejectedNoJobVideoState.tasks[0].status,
+  "storyboard_ready",
+  "saved rejected no-job video tasks are restored instead of wasting the generated storyboard"
+);
+
+const migratedLocalOnlyImageVideoState = Core.migrateState({
+  ...Core.createInitialState(),
+  tasks: [{
+    id: "local-only-image-video",
+    title: "净饮机 · 本地图",
+    productName: "净饮机",
+    status: "rejected",
+    reviewNote: "模型无法接收产品图：产品图目前只有本地路径或本地上传数据，视频模型无法访问。",
+    storyboard: [{ time: "0-15s", title: "产品展示", visual: "展示净饮机", subtitle: "Clean water", videoPrompt: "product video" }],
+    video: null,
+    providerRequests: { video: { endpoint: "https://example.test/videos" } },
+    providerResponses: { video: { ok: false, error: "模型无法接收产品图：产品图目前只有本地路径或本地上传数据，视频模型无法访问。" } },
+  }],
+});
+assert.strictEqual(
+  migratedLocalOnlyImageVideoState.tasks[0].status,
+  "storyboard_ready",
+  "saved local-only image failures are restored to storyboard-ready because the storyboard is still reusable"
+);
+
+const videoQualityReviewRequest = Core.buildVideoQualityReviewProviderRequest(state, created, state.products[0]);
+assert.strictEqual(videoQualityReviewRequest.provider, state.integrations.llm.provider, "video quality review uses configured LLM provider");
+assert.strictEqual(videoQualityReviewRequest.body.model, state.integrations.llm.model, "video quality review uses configured GPT model");
+const videoQualityPayload = userMessagePayload(videoQualityReviewRequest);
+assert.strictEqual(videoQualityPayload.task.video.url, "https://example.test/generated.mp4", "video quality review includes generated video URL");
+assert.strictEqual(videoQualityPayload.referenceMaterials.length, 1, "video quality review includes product reference materials");
+assert.ok(JSON.stringify(videoQualityReviewRequest.body).includes("穿模"), "video quality review checks severe penetration artifacts");
+assert.ok(JSON.stringify(videoQualityReviewRequest.body).includes("retry_prompt"), "video quality review asks for retry prompt advice");
+
+const appliedQualityReview = Core.applyVideoQualityReviewProviderResult(created, {
+  upstream: {
+    data: {
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            review_status: "fail",
+            score: 58,
+            issues: ["水箱颜色错误", "手部穿过产品边缘"],
+            suggestion: "保留黑色半透明水箱，手只能接触产品表面。",
+            retry_prompt: "上次水箱颜色错误，本次必须保留黑色半透明水箱。",
+            should_retry: true,
+          }),
+        },
+      }],
+    },
+  },
+});
+assert.strictEqual(appliedQualityReview, true, "video quality review response is applied");
+assert.strictEqual(created.videoQualityReview.status, "fail", "video quality review stores normalized fail status");
+assert.strictEqual(created.videoQualityReview.score, 58, "video quality review stores normalized score");
+assert.deepStrictEqual(created.videoQualityReview.issues, ["水箱颜色错误", "手部穿过产品边缘"], "video quality review stores issues");
+assert.strictEqual(created.videoQualityReview.shouldRetry, true, "video quality review stores retry decision");
+assert.ok(created.videoQualityReview.retryPrompt.includes("黑色半透明水箱"), "video quality review stores retry prompt");
 
 Core.applyVideoProviderResult(created, {
   upstream: {

@@ -11,7 +11,9 @@
     "desktop:dev": "electron .",
     "verify": "node --check mvp/app.js && node --check mvp/core.js && node --check mvp/server.js && node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/runtime.js && node --check desktop/verify-runtime.js && node --check desktop/verify-package.js && node mvp/verify-core.js && node mvp/verify-app.js && node mvp/verify-server.js && node desktop/verify-runtime.js && node desktop/verify-package.js",
     "build:win": "electron-builder --win nsis portable --x64",
-    "build:win:dir": "electron-builder --win dir --x64"
+    "build:win:dir": "electron-builder --win dir --x64",
+    "prepare:mac-video-tools": "node scripts/bundle-mac-video-tools.mjs",
+    "build:mac": "npm run prepare:mac-video-tools && electron-builder --mac dmg zip --arm64"
   },
   "build": {
     "appId": "com.warmseadog.ai-video-workbench",

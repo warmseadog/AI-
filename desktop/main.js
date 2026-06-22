@@ -5,17 +5,22 @@ const { desktopDataPaths, startMvpServer } = require("./runtime");
 let mainWindow = null;
 let mvpRuntime = null;
 
-function configureBundledFfmpeg() {
-  if (process.env.AI_VIDEO_FFMPEG_PATH) return;
-  const executable = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+function configureBundledBinary(envKey, baseName) {
+  if (process.env[envKey]) return;
+  const executable = process.platform === "win32" ? `${baseName}.exe` : baseName;
   const candidates = [
     path.join(process.resourcesPath || "", "bin", executable),
     path.join(__dirname, "..", "resources", "bin", executable),
   ];
-  const ffmpegPath = candidates.find((candidate) => candidate && require("fs").existsSync(candidate));
-  if (ffmpegPath) {
-    process.env.AI_VIDEO_FFMPEG_PATH = ffmpegPath;
+  const binaryPath = candidates.find((candidate) => candidate && require("fs").existsSync(candidate));
+  if (binaryPath) {
+    process.env[envKey] = binaryPath;
   }
+}
+
+function configureBundledVideoTools() {
+  configureBundledBinary("AI_VIDEO_FFMPEG_PATH", "ffmpeg");
+  configureBundledBinary("AI_VIDEO_FFPROBE_PATH", "ffprobe");
 }
 
 function isAppUrl(url) {
@@ -40,7 +45,7 @@ function protectNavigation(window) {
 
 async function createMainWindow() {
   const paths = desktopDataPaths(app.getPath("userData"));
-  configureBundledFfmpeg();
+  configureBundledVideoTools();
   mvpRuntime = await startMvpServer({
     host: "127.0.0.1",
     port: 0,

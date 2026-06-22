@@ -1393,9 +1393,44 @@ textarea:focus {
   justify-content: space-between;
 }
 
+.reference-guidance-copy {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .reference-group-head strong {
   color: var(--ink);
   font-size: 13px;
+}
+
+.reference-role-guide {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px;
+}
+
+.reference-role-chip {
+  display: grid;
+  gap: 2px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.reference-role-chip strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.reference-role-chip em,
+.reference-purpose {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.4;
 }
 
 .reference-actions {
@@ -1481,6 +1516,10 @@ textarea:focus {
   white-space: nowrap;
 }
 
+.reference-purpose {
+  margin: 0;
+}
+
 .reference-empty {
   padding: 9px;
   border: 1px dashed var(--line);
@@ -1497,6 +1536,24 @@ textarea:focus {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fbfcff;
+}
+
+.content-plan-review {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-soft);
+}
+
+.content-plan-review summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.content-plan-review .content-plan-editor {
+  margin: 0 10px 10px;
 }
 
 .editor-head {

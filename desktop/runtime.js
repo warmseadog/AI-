@@ -5,6 +5,18 @@ function appUrl(host, port) {
   return `http://${host}:${port}`;
 }
 
+const bundledImageHostDefaults = {
+  IMAGE_HOST_PROVIDER: "imgbb",
+  IMGBB_API_KEY: "c8c18845368a2c2a25e2ca56452b0858",
+  IMGBB_UPLOAD_ENDPOINT: "https://api.imgbb.com/1/upload",
+};
+
+function applyBundledImageHostDefaults() {
+  Object.entries(bundledImageHostDefaults).forEach(([key, value]) => {
+    if (!process.env[key]) process.env[key] = value;
+  });
+}
+
 function desktopDataPaths(userDataRoot) {
   return {
     userDataRoot,
@@ -16,6 +28,7 @@ function desktopDataPaths(userDataRoot) {
 function loadMvpServer(outputsRoot) {
   const serverPath = path.join(__dirname, "..", "mvp", "server.js");
   process.env.AI_VIDEO_OUTPUTS_ROOT = outputsRoot;
+  applyBundledImageHostDefaults();
   delete require.cache[require.resolve(serverPath)];
   return require(serverPath);
 }
@@ -63,6 +76,7 @@ async function startMvpServer(options = {}) {
 
 module.exports = {
   appUrl,
+  applyBundledImageHostDefaults,
   desktopDataPaths,
   startMvpServer,
 };

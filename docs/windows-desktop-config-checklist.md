@@ -22,14 +22,14 @@
 
 | 字段 | 是否必填 | 说明 |
 | --- | --- | --- |
-| `provider` | 是 | 视频生成服务商或自定义接口标识。 |
-| `apiStyle` | 是 | 视频接口格式，例如 ToAPIs 视频接口、DashScope 视频接口、自定义视频接口。 |
-| `endpoint` | 是 | 提交视频生成任务的接口地址。 |
+| `provider` | 是 | 默认使用 `jimeng-seedance-official`，即官方即梦 / Seedance 接口。 |
+| `apiStyle` | 是 | 默认使用 `jimeng-seedance-official`。保留 ToAPIs、DashScope、自定义视频接口用于兼容旧配置。 |
+| `endpoint` | 是 | 官方即梦提交视频生成任务的接口地址。当前默认：`https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks`。 |
 | `statusEndpoint` | 是 | 查询视频任务结果的接口地址，通常需要包含 `{task_id}`。 |
-| `model` | 是 | 视频模型名。 |
+| `model` | 是 | 官方即梦 / Seedance 视频模型名。当前默认标准版：`doubao-seedance-2-0-260128`；Fast 版可填：`doubao-seedance-2-0-fast-260128`。 |
 | `apiKey` | 是 | 只填写在本机，不要在清单里展示真实值。 |
 
-注意：如果视频生成服务需要公开可访问的产品图 URL，上传素材后要先确认图片地址能被上游服务访问。
+注意：产品参考图必须能被官方接口识别。推荐上传 5-7 张产品图，并分别标记为：主图、正面、侧面、背面、45 度、细节、场景图。主图用于锁定整体外观，细节图用于补充结构，场景图只参考环境和摆放，不改变产品本体。
 
 ## 3. PostEverywhere 发布配置
 

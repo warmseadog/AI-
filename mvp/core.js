@@ -110,7 +110,14 @@
   ];
 
   const videoProviders = [
-    { id: "seedfast2", name: "小云雀 SeedFast2", endpoint: "", model: "SeedFast2" },
+    {
+      id: "jimeng-seedance-official",
+      name: "即梦官方 / Seedance",
+      apiStyle: "jimeng-seedance-official",
+      endpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+      statusEndpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/{task_id}",
+      model: "doubao-seedance-2-0-260128",
+    },
     {
       id: "toapis-seedance",
       name: "Seedance 2 / ToAPIs",
@@ -127,6 +134,7 @@
       statusEndpoint: "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
       model: "wan2.7-i2v-2026-04-25",
     },
+    { id: "seedfast2", name: "小云雀 SeedFast2", endpoint: "", model: "SeedFast2" },
     { id: "seedance", name: "Seedance / 火山引擎", endpoint: "", model: "Seedance" },
     { id: "kling", name: "可灵", endpoint: "", model: "Kling" },
     { id: "runway", name: "Runway", endpoint: "", model: "Runway" },
@@ -170,7 +178,7 @@
     contentBrief: {
       seed: "",
       text: "",
-      storyboardSceneCount: "auto",
+      storyboardSceneCount: "6",
       storyboardDetailLevel: "detailed",
       videoBatchCount: 1,
       videoCreationStrategy: "original",
@@ -200,10 +208,11 @@
       },
       video: {
         mode: "http",
-        provider: "seedfast2",
-        apiStyle: "generic-video",
-        endpoint: "",
-        model: "SeedFast2",
+        provider: "jimeng-seedance-official",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+        statusEndpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/{task_id}",
+        model: "doubao-seedance-2-0-260128",
         apiKey: "",
         providerConfigs: {},
       },
@@ -480,35 +489,50 @@
     return name ? `${name} 产品图` : "上传产品图";
   }
 
-  const productImageRoles = ["主图", "正面", "侧面", "背面", "细节", "包装", "场景"];
+  const productImageRoles = ["主图", "正面", "侧面", "背面", "45 度", "细节", "场景图"];
+  const productImageRolePurposes = {
+    "主图": "主图锁定整体外观、颜色、比例和主体轮廓。",
+    "正面": "正面锁定面板、Logo、出水口、按钮等正向关键结构。",
+    "侧面": "侧面补充机身厚度、水箱、侧边结构和材质过渡。",
+    "背面": "背面补充背部比例、接口、背板和不可忽略的结构。",
+    "45 度": "45 度图补充立体体积、边角弧度和前侧关系。",
+    "细节": "细节图锁定托盘、按钮、Logo、出水口、水箱材质等局部。",
+    "场景图": "场景图只参考环境、台面摆放、手部动作和氛围，不改变产品本体。",
+  };
 
   function normalizeProductImageRole(value, fallback) {
     const role = String(value || "").trim();
+    if (role === "场景") return "场景图";
+    if (role === "包装") return "细节";
+    if (/45|四十五|斜/i.test(role)) return "45 度";
     if (productImageRoles.includes(role)) return role;
     return fallback || "细节";
   }
 
   function productImageFallbackRole(index) {
-    return index === 0 ? "主图" : "细节";
+    return productImageRoles[Math.min(index, productImageRoles.length - 1)] || "细节";
   }
 
   function normalizeProductImage(input, index = 0) {
     if (!input || typeof input !== "object") return null;
     const url = String(input.url || "").trim();
+    const publicUrl = String(input.publicUrl || input.publicURL || "").trim();
     const dataUrl = String(input.dataUrl || input.dataURL || input.imageData || "").trim();
-    if (!url && !dataUrl) return null;
-    const type = url ? "url" : "upload";
+    if (!url && !publicUrl && !dataUrl) return null;
+    const type = publicUrl ? "hosted" : (url ? "url" : "upload");
     const label = String(input.label || input.imageLabel || "").trim() || (type === "url" ? "图片 URL" : "上传产品图");
     const priority = Number.isFinite(Number(input.priority)) ? Number(input.priority) : index + 1;
     return {
       id: String(input.id || uid("product-image")),
       type,
       url,
+      publicUrl,
       dataUrl,
       label,
       role: normalizeProductImageRole(input.role, productImageFallbackRole(index)),
       priority,
       useForVideo: input.useForVideo === false ? false : true,
+      modelVisible: Boolean(input.modelVisible || publicUrl),
     };
   }
 
@@ -598,19 +622,36 @@
       useForVideo: image.useForVideo !== false,
     };
     if (image.url) material.url = image.url;
+    if (image.publicUrl) material.publicUrl = image.publicUrl;
     if (image.dataUrl) material.dataUrl = image.dataUrl;
+    if (image.modelVisible) material.modelVisible = true;
+    return material;
+  }
+
+  function productImageUrlMaterial(product, priority = 1) {
+    const imageUrl = String(product && product.imageUrl || "").trim();
+    if (!imageUrl) return null;
+    const material = { type: "url", label: "图片 URL", role: "主图", priority, useForVideo: true, url: imageUrl };
+    if (/^https?:\/\//i.test(imageUrl)) material.modelVisible = true;
     return material;
   }
 
   function productMaterials(product) {
     if (product && Array.isArray(product.images) && product.images.length) {
-      return sortedProductImages(product.images).map(materialFromProductImage);
+      const materials = sortedProductImages(product.images).map(materialFromProductImage);
+      const imageUrlMaterial = productImageUrlMaterial(product, 0);
+      if (imageUrlMaterial && !httpMaterialUrls(materials).length) {
+        const imageUrl = String(imageUrlMaterial.url || "").trim();
+        const alreadyIncluded = materials.some((material) => {
+          return String(material.publicUrl || material.url || "").trim() === imageUrl;
+        });
+        if (!alreadyIncluded) materials.unshift(imageUrlMaterial);
+      }
+      return materials;
     }
     const materials = [];
-    const imageUrl = String(product && product.imageUrl || "").trim();
-    if (imageUrl) {
-      materials.push({ type: "url", label: "图片 URL", role: "主图", priority: 1, useForVideo: true, url: imageUrl });
-    }
+    const imageUrlMaterial = productImageUrlMaterial(product, 1);
+    if (imageUrlMaterial) materials.push(imageUrlMaterial);
     const imageData = String(product && product.imageData || "").trim();
     if (imageData) {
       materials.push({
@@ -630,13 +671,75 @@
   }
 
   function materialUrl(material) {
-    return material && String(material.url || material.dataUrl || "").trim();
+    return material && String(material.publicUrl || material.url || material.dataUrl || "").trim();
   }
 
   function httpMaterialUrls(materials) {
     return materials
-      .map((material) => String(material.url || "").trim())
+      .map((material) => String(material.publicUrl || material.url || "").trim())
       .filter((url) => /^https?:\/\//i.test(url));
+  }
+
+  function isDataImageUrl(value) {
+    return /^data:image\/[a-z0-9.+-]+;base64,/i.test(String(value || "").trim());
+  }
+
+  function isLocalOutputUrl(value) {
+    return /^\/outputs\/uploads\//i.test(String(value || "").trim());
+  }
+
+  function jimengMaterialReferences(materials) {
+    return materials
+      .map((material) => {
+        const dataUrl = String(material && material.dataUrl || "").trim();
+        const publicUrl = String(material && material.publicUrl || "").trim();
+        const url = String(material && material.url || "").trim();
+        const localUrl = isLocalOutputUrl(url) ? url : "";
+        const modelUrl = isDataImageUrl(dataUrl) ? dataUrl : (/^https?:\/\//i.test(publicUrl || url) ? (publicUrl || url) : localUrl);
+        if (!modelUrl) return null;
+        return {
+          url: modelUrl,
+          localUrl: localUrl && modelUrl !== dataUrl ? localUrl : "",
+        };
+      })
+      .filter(Boolean);
+  }
+
+  function modelVisibleProductImageValidation(product, videoMaterials, videoImageUrls) {
+    return {
+      required: true,
+      productName: productDisplayName(product),
+      materialCount: videoMaterials.length,
+      imageUrlCount: videoImageUrls.length,
+      missingReason: videoMaterials.length
+        ? "产品图目前只有本地路径或本地上传数据，视频模型无法访问。"
+        : "当前任务没有可用于视频生成的产品图。",
+    };
+  }
+
+  function modelVisibleProductImageError(validation) {
+    const reason = validation && validation.missingReason || "视频模型没有收到产品图链接。";
+    return `模型无法接收产品图：${reason} 请先上传到 ImgBB/公网图床，或填写公网 HTTPS 图片链接后再生成视频。`;
+  }
+
+  function assertModelVisibleProductImages(validation) {
+    if (!validation || validation.required !== true) return;
+    if (Number(validation.imageUrlCount || 0) > 0) return;
+    const error = new Error(modelVisibleProductImageError(validation));
+    error.code = "MODEL_VISIBLE_PRODUCT_IMAGE_REQUIRED";
+    throw error;
+  }
+
+  function jimengReferenceImageContent(references) {
+    return references.slice(0, 9).map((reference) => {
+      const imageUrl = { url: reference.url };
+      if (reference.localUrl) imageUrl.local_url = reference.localUrl;
+      return {
+        role: "reference_image",
+        type: "image_url",
+        image_url: imageUrl,
+      };
+    });
   }
 
   function listItemText(value) {
@@ -983,7 +1086,7 @@
 
   function frameDataUrl(frame) {
     const dataUrl = String(frame && frame.dataUrl || "").trim();
-    return /^data:image\//i.test(dataUrl) ? dataUrl : "";
+    return /^(data:image\/|https?:\/\/)/i.test(dataUrl) ? dataUrl : "";
   }
 
   function visionFrameInputs(userContent) {
@@ -1137,11 +1240,13 @@
           type: "object",
           description: "内容规划必须中文为主；除少量面向美国观众的英文短句外，运营审核字段至少 80% 使用简体中文，不允许整段英文输出。",
           additionalProperties: true,
-          required: ["productUnderstanding", "targetAudience", "keySellingPoints", "strategy", "hook"],
+          required: ["keySellingPoints", "mainPainPoint", "videoThroughline", "mustShow", "mustAvoid"],
           properties: {
             productUnderstanding: { type: "string" },
             targetAudience: { type: "string" },
             keySellingPoints: { type: "array", items: { type: "string" } },
+            mainPainPoint: { type: "string" },
+            videoThroughline: { type: "string" },
             usageScenarios: { type: "array", items: { type: "string" } },
             painPoints: { type: "array", items: { type: "string" } },
             contentAngle: { type: "string" },
@@ -1169,24 +1274,20 @@
       duration: 15,
       ratio: "9:16",
       outputLanguage: readableChineseOutputSpec("content plan"),
+      lengthPolicy: "生成分镜前置摘要，不写完整营销策划案；总字数控制在 300-500 中文字以内。",
+      fieldLimits: {
+        keySellingPoints: "最多 3 条，只保留影响画面的核心卖点。",
+        mainPainPoint: "只写 1 个主痛点。",
+        videoThroughline: "只写 1 句话，说明视频从哪里切入、如何转到产品、如何收尾。",
+        mustShow: "最多 5 条，必须是视频里必须出现的具体画面。",
+        mustAvoid: "最多 3 条，合规和产品不跑偏约束合并在这里。",
+      },
       outputFields: [
-        "productUnderstanding",
-        "targetAudience",
         "keySellingPoints",
-        "usageScenarios",
-        "painPoints",
-        "contentAngle",
-        "hookOptions",
-        "coreMessage",
-        "strategy",
-        "hook",
-        "visualStyle",
-        "rhythm",
+        "mainPainPoint",
+        "videoThroughline",
         "mustShow",
         "mustAvoid",
-        "cta",
-        "reviewSummary",
-        "complianceNotes",
       ],
     };
     return {
@@ -1196,7 +1297,121 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
-      body: buildLlmBody(integration, `你是跨境电商短视频内容规划助手。根据用户想法和产品图生成完整、可审核、可人工修改的短视频内容规划。规划必须细到目标用户、痛点、卖点、视觉风格、节奏、必拍画面、禁用夸张表达和 CTA。不要输出分镜、镜头拆分、时间轴、字幕字段或视频生成提示词。${readableChineseSystemInstruction("content plan 的所有可读字段")}只输出结构化 JSON，不要编造未经证实的功效。`, userContent, "content_plan", schema),
+      body: buildLlmBody(integration, `你是跨境电商短视频分镜前置摘要助手。根据用户想法和产品图，只生成一份短摘要，帮助后续分镜抓住重点。不要写完整营销策划案，不要展开目标用户画像、使用场景、视觉风格、节奏长段落、CTA 长段落。总字数控制在 300-500 中文字以内。只输出 5 个字段：keySellingPoints 最多 3 条、mainPainPoint 1 句、videoThroughline 1 句、mustShow 最多 5 条、mustAvoid 最多 3 条。不要输出分镜、镜头拆分、时间轴、字幕字段或视频生成提示词。${readableChineseSystemInstruction("content plan 的所有可读字段")}只输出结构化 JSON，不要编造未经证实的功效。`, userContent, "content_plan", schema),
+    };
+  }
+
+  function buildStoryboardFromIdeaProviderRequest(state, options = {}) {
+    const integration = state.integrations.llm;
+    const product = getById(state.products, state.selectedProductId);
+    const materials = requireProductMaterials(product);
+    const idea = String(state.contentBrief && state.contentBrief.seed || "").trim();
+    if (!idea) {
+      throw new Error("请先输入视频想法。");
+    }
+    const duration = Number(options.duration || 15);
+    const configuredCount = options.sceneCount || state.contentBrief && state.contentBrief.storyboardSceneCount || "6";
+    const sceneCount = storyboardSceneCountForDuration(duration, configuredCount);
+    const detailLevel = options.detailLevel || state.contentBrief && state.contentBrief.storyboardDetailLevel || "detailed";
+    const schema = {
+      type: "object",
+      additionalProperties: true,
+      required: ["tasks"],
+      properties: {
+        tasks: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            description: "直接根据用户视频想法生成的分镜任务必须中文为主；title、angle、strategy、reviewSummary 使用简体中文，不允许纯英文段落。",
+            additionalProperties: true,
+            required: ["angle", "hook", "duration", "scenes"],
+            properties: {
+              title: { type: "string" },
+              angle: { type: "string" },
+              hook: { type: "string" },
+              duration: { type: "number" },
+              strategy: { type: "string" },
+              reviewSummary: { type: "string" },
+              scenes: {
+                type: "array",
+                minItems: sceneCount,
+                maxItems: sceneCount,
+                items: {
+                  type: "object",
+                  description: "单个镜头必须中文为主。只有 subtitle、screenText、voiceover 的观众短句可少量英文；visual、camera、motion、imagePrompt、videoPrompt、negativePrompt、productFocus 必须中文为主。",
+                  additionalProperties: true,
+                  required: ["time", "title", "visual", "subtitle", "videoPrompt"],
+                  properties: {
+                    time: { type: "string" },
+                    startSecond: { type: "number" },
+                    endSecond: { type: "number" },
+                    durationSecond: { type: "number" },
+                    title: { type: "string" },
+                    visual: { type: "string" },
+                    subtitle: { type: "string" },
+                    camera: { type: "string" },
+                    motion: { type: "string" },
+                    voiceover: { type: "string" },
+                    screenText: { type: "string" },
+                    imagePrompt: { type: "string" },
+                    videoPrompt: { type: "string" },
+                    negativePrompt: { type: "string" },
+                    productFocus: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    const userContent = {
+      product: productAiContext(product),
+      materials,
+      idea,
+      source: "direct_idea_to_storyboard",
+      targetPlatform: state.selectedPlatforms && state.selectedPlatforms[0] || "tiktok",
+      market: "US",
+      sceneCount,
+      configuredSceneCount: configuredCount,
+      detailLevel,
+      detailInstruction: storyboardDetailLabel(detailLevel),
+      duration,
+      ratio: "9:16",
+      outputLanguage: readableChineseOutputSpec("storyboard"),
+      timingRequirements: {
+        exactDurationSeconds: duration,
+        sceneCount,
+        mustCoverFullRange: `分镜必须从 0s 开始，最后一个镜头必须精确结束在 ${duration}s。`,
+        preferredCut: `${duration}s 视频默认拆成 ${sceneCount} 个镜头，每个镜头只表达一个画面动作或信息点。`,
+      },
+      outputFields: [
+        "time",
+        "startSecond",
+        "endSecond",
+        "durationSecond",
+        "title",
+        "visual",
+        "subtitle",
+        "camera",
+        "motion",
+        "voiceover",
+        "screenText",
+        "imagePrompt",
+        "videoPrompt",
+        "negativePrompt",
+        "productFocus",
+      ],
+    };
+    return {
+      provider: integration.provider,
+      mode: integration.mode,
+      apiStyle: integration.apiStyle,
+      endpoint: integration.endpoint,
+      model: integration.model,
+      apiKey: integration.apiKey,
+      body: buildLlmBody(integration, `你是短视频分镜策划助手。根据用户的视频想法、产品资料和产品图，直接生成可执行分镜脚本。不要输出前置摘要、营销策划案或中间规划；只输出结构化 JSON。镜头数量必须等于请求的 sceneCount，且完整覆盖指定时长。${readableChineseSystemInstruction("直接生成的分镜脚本、镜头字段和视频提示词")}`, userContent, "video_storyboard_batch", schema),
     };
   }
 
@@ -1467,7 +1682,7 @@
     const seconds = Number(duration || 15);
     if (seconds <= 6) return 4;
     if (seconds <= 10) return 6;
-    return 8;
+    return 6;
   }
 
   function storyboardDetailLabel(level) {
@@ -1626,7 +1841,7 @@
       "产品参考图为最高优先级：视频中的产品必须严格匹配所选产品参考图。",
       referenceLines.length ? `产品参考图组：\n${referenceLines.join("\n")}` : "",
       videoMaterials.length > 1 ? "主图决定整体外观；正面、侧面、背面和细节图只用于补全结构，不得互相混淆或生成另一款产品。" : "",
-      materials.some((material) => material.role === "场景" || material.useForVideo === false) ? "场景图只参考使用环境、手部动作和氛围，不得改变产品本体的颜色、轮廓、比例、材质和关键结构。" : "",
+      materials.some((material) => material.role === "场景图" || material.useForVideo === false) ? "场景图只参考使用环境、手部动作和氛围，不得改变产品本体的颜色、轮廓、比例、材质和关键结构。" : "",
       "不得改变产品颜色、外观轮廓、比例、材质和关键结构；不得改成同类但不同款产品；不得自动美化成其他品牌或其他型号。",
       "允许改变镜头角度、光线和场景，但产品本体的形状、配色、部件位置、面板/按钮/出水口/托盘等关键细节必须保持一致。",
       hasReferenceImage ? "如果视频模型支持图生视频，必须把所选产品图作为产品身份参考，而不是只按文字想象产品。" : "",
@@ -1642,21 +1857,53 @@
     return genericLock.join("\n");
   }
 
+  function compactVideoPromptText(value, maxLength = 180) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength).replace(/[，,；;。\s]+$/g, "")}。`;
+  }
+
+  function sceneVideoInstruction(scene, options = {}) {
+    const includeAudienceCopy = Boolean(options.includeAudienceCopy);
+    const visual = compactVideoPromptText(scene.videoPrompt || scene.visual || "", 180);
+    const cameraMotion = compactVideoPromptText([scene.camera, scene.motion].filter(Boolean).join("；"), 140);
+    const productFocus = compactVideoPromptText(scene.productFocus || "", 120);
+    const negativePrompt = compactVideoPromptText(scene.negativePrompt || "", 120);
+    const parts = [
+      `${scene.time} ${scene.title || ""}`.trim(),
+      visual ? `画面：${visual}` : "",
+      cameraMotion ? `运镜动作：${cameraMotion}` : "",
+      productFocus ? `产品要求：${productFocus}` : "",
+      includeAudienceCopy && scene.subtitle ? `字幕：${compactVideoPromptText(scene.subtitle, 80)}` : "",
+      includeAudienceCopy && scene.voiceover ? `旁白：${compactVideoPromptText(scene.voiceover, 100)}` : "",
+      includeAudienceCopy && scene.screenText ? `屏幕字：${compactVideoPromptText(scene.screenText, 80)}` : "",
+      negativePrompt ? `负面约束：${negativePrompt}` : "",
+    ].filter(Boolean);
+    return parts.join("；");
+  }
+
   function buildVideoProviderRequest(state, task, product) {
     const integration = state.integrations.video;
     if (!Array.isArray(task.storyboard) || !task.storyboard.length) {
       throw new Error("请先用当前内容规划生成分镜，再生成视频。");
     }
-    const timedStoryboard = normalizeStoryboardTiming(task.storyboard, task.duration || 15);
+    const normalizedTaskDuration = integration.apiStyle === "jimeng-seedance-official" ? 15 : Number(task.duration || 15);
+    const timedStoryboard = normalizeStoryboardTiming(task.storyboard, normalizedTaskDuration);
     task.storyboard = timedStoryboard;
     task.storyboardTimingStatus = timedStoryboard.timingStatus;
-    task.duration = Number(task.duration || 15);
+    task.duration = normalizedTaskDuration;
     task.videoResolution = normalizeVideoResolution(task.videoResolution || task.contentBrief?.videoResolution || state.contentBrief?.videoResolution);
     const details = productAiContext(product);
     const productName = details.name || productDisplayName(product);
     const videoMaterials = videoProductMaterials(product);
-    const videoMaterialUrls = videoMaterials.map(materialUrl).filter(Boolean);
     const videoHttpUrls = httpMaterialUrls(videoMaterials);
+    const officialJimengReferences = integration.apiStyle === "jimeng-seedance-official" ? jimengMaterialReferences(videoMaterials) : [];
+    const referenceImageValidation = modelVisibleProductImageValidation(
+      product,
+      videoMaterials,
+      integration.apiStyle === "jimeng-seedance-official" ? officialJimengReferences : videoHttpUrls
+    );
+    assertModelVisibleProductImages(referenceImageValidation);
     const visualIdentity = productVisualIdentityPrompt(product, productName);
     const productFacts = [
       `生成产品：${productName}`,
@@ -1679,24 +1926,13 @@
           task.sourceFidelityInstruction || "",
         ].filter(Boolean).join("\n")
       : "";
-    const prompt = task.storyboard.map((scene) => {
-      const parts = [
-        `${scene.time} ${scene.title || ""}`.trim(),
-        `画面：${scene.videoPrompt || scene.visual || ""}`,
-        scene.camera ? `镜头：${scene.camera}` : "",
-        scene.motion ? `动作：${scene.motion}` : "",
-        scene.subtitle ? `字幕：${scene.subtitle}` : "",
-        scene.voiceover ? `旁白：${scene.voiceover}` : "",
-        scene.screenText ? `屏幕字：${scene.screenText}` : "",
-        scene.negativePrompt ? `负面约束：${scene.negativePrompt}` : "",
-      ].filter(Boolean);
-      return parts.join("；");
-    }).join("\n");
+    const includeAudienceCopy = task.source === "reverse-video";
+    const prompt = task.storyboard.map((scene) => sceneVideoInstruction(scene, { includeAudienceCopy })).join("\n");
     const durationPrompt = `Target duration: exactly ${task.duration}s. The sequence starts at 0s and the final scene ends at ${task.duration}s.`;
     const stylePrompt = task.videoStyleInstruction || "";
     const fullPrompt = [productFacts, sourceFidelityPrompt, stylePrompt, durationPrompt, prompt].filter(Boolean).join("\n");
     if (integration.apiStyle === "dashscope-video") {
-      const imageUrl = videoMaterialUrls[0] || "";
+      const imageUrl = videoHttpUrls[0] || "";
       const isWan27 = /^wan2\.7-/i.test(String(integration.model || ""));
       const input = isWan27
         ? {
@@ -1713,6 +1949,8 @@
         statusEndpoint: integration.statusEndpoint,
         model: integration.model,
         apiKey: integration.apiKey,
+        requiresReferenceImage: true,
+        referenceImageValidation,
         headers: { "X-DashScope-Async": "enable" },
         body: {
           model: integration.model,
@@ -1748,12 +1986,46 @@
         statusEndpoint: integration.statusEndpoint,
         model: integration.model,
         apiKey: integration.apiKey,
+        requiresReferenceImage: true,
+        referenceImageValidation,
         duration: {
           requested: requestedDuration,
           submitted: submittedDuration,
           supported: viduQ3 ? [1, 16] : toapisSupportedDurations.slice(),
         },
         body,
+      };
+    }
+    if (integration.apiStyle === "jimeng-seedance-official") {
+      const referenceImages = officialJimengReferences.slice(0, 9);
+      return {
+        provider: integration.provider,
+        mode: integration.mode,
+        apiStyle: integration.apiStyle,
+        endpoint: integration.endpoint,
+        statusEndpoint: integration.statusEndpoint,
+        model: integration.model,
+        apiKey: integration.apiKey,
+        requiresReferenceImage: true,
+        referenceImageValidation,
+        expectedDuration: 15,
+        duration: {
+          requested: Number(task.duration || 15),
+          submitted: 15,
+          supported: [4, 15],
+        },
+        body: {
+          model: integration.model,
+          content: [
+            { type: "text", text: fullPrompt },
+            ...jimengReferenceImageContent(referenceImages),
+          ],
+          duration: Math.max(4, Math.min(Number(task.duration || 15), 15)),
+          ratio: task.ratio || "9:16",
+          resolution: normalizeVideoResolution(task.videoResolution),
+          watermark: false,
+          camera_fixed: false,
+        },
       };
     }
     return {
@@ -1763,13 +2035,15 @@
       endpoint: integration.endpoint,
       model: integration.model,
       apiKey: integration.apiKey,
+      requiresReferenceImage: true,
+      referenceImageValidation,
       body: {
         model: integration.model,
         provider: integration.provider,
         duration: task.duration,
         ratio: task.ratio,
         resolution: normalizeVideoResolution(task.videoResolution),
-        image: product && product.imageData ? "local-product-image-data-url" : null,
+        image: videoHttpUrls[0] || null,
         prompt: fullPrompt,
         negative_prompt: "blur, distorted product, wrong logo, unreadable text",
       },
@@ -1780,13 +2054,46 @@
     return task && task.video && (task.video.jobId || task.video.taskId || task.video.id);
   }
 
+  function missingVideoJobMessage() {
+    return "视频任务已进入生成中，但本地没有保存视频任务 ID，无法查询视频结果。请重新生成视频。";
+  }
+
+  function markVideoTaskMissingJob(task) {
+    const message = missingVideoJobMessage();
+    task.video = Object.assign({}, task.video || {}, {
+      url: "",
+      providerStatus: "NO_LOCAL_JOB",
+      providerMessage: message,
+    });
+    task.reviewNote = message;
+    const hasStoryboard = Array.isArray(task.storyboard) && task.storyboard.length;
+    return setTaskStatus(task, hasStoryboard ? "storyboard_ready" : "content_plan_ready");
+  }
+
   function buildVideoStatusProviderRequest(state, task) {
-    const integration = state.integrations.video || {};
+    const currentIntegration = state.integrations.video || {};
+    const generationRequest = task && task.providerRequests && task.providerRequests.video || {};
+    const integration = Object.assign({}, currentIntegration, {
+      provider: generationRequest.provider || currentIntegration.provider,
+      mode: generationRequest.mode || currentIntegration.mode,
+      apiStyle: generationRequest.apiStyle || currentIntegration.apiStyle,
+      endpoint: generationRequest.endpoint || currentIntegration.endpoint,
+      statusEndpoint: generationRequest.statusEndpoint || currentIntegration.statusEndpoint,
+      model: generationRequest.model || currentIntegration.model,
+      apiKey: generationRequest.apiKey || currentIntegration.apiKey,
+    });
     const jobId = taskJobId(task);
     if (!jobId) {
       throw new Error("当前任务还没有视频任务 ID");
     }
     const template = integration.statusEndpoint || "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}";
+    const expectedDuration = Number(
+      generationRequest.expectedDuration ||
+      generationRequest.duration && generationRequest.duration.submitted ||
+      generationRequest.body && generationRequest.body.parameters && generationRequest.body.parameters.duration ||
+      generationRequest.body && generationRequest.body.duration ||
+      task && task.duration
+    ) || 0;
     return {
       provider: integration.provider,
       mode: integration.mode,
@@ -1795,6 +2102,108 @@
       endpoint: template.replace("{task_id}", encodeURIComponent(jobId)),
       model: integration.model,
       apiKey: integration.apiKey,
+      expectedDuration: expectedDuration || undefined,
+    };
+  }
+
+  function videoQualityReferenceFrames(product) {
+    return productMaterials(product).map((material, index) => {
+      const imageUrl = materialUrl(material);
+      return {
+        index,
+        label: `产品参考图-${index + 1}`,
+        role: material.role || "产品参考",
+        source: "reference",
+        dataUrl: imageUrl,
+      };
+    }).filter((frame) => frame.dataUrl);
+  }
+
+  function compactFrameMetadata(frames) {
+    return (Array.isArray(frames) ? frames : []).map((frame, index) => {
+      const copy = Object.assign({}, frame || {}, { index });
+      if (copy.dataUrl) {
+        delete copy.dataUrl;
+        copy.inlineImageProvided = true;
+      }
+      return copy;
+    });
+  }
+
+  function buildVideoQualityReviewProviderRequest(state, task, product, options = {}) {
+    const integration = state.integrations.llm;
+    if (!task || !task.video || !String(task.video.url || "").trim()) {
+      throw new Error("视频生成完成后才能执行 AI 审查。");
+    }
+    const referenceFrames = videoQualityReferenceFrames(product);
+    const generatedFrames = (Array.isArray(options.frames) ? options.frames : [])
+      .map((frame, index) => Object.assign({}, frame || {}, {
+        index,
+        source: "generated_video",
+        label: frame && frame.label || `生成视频关键帧-${index + 1}`,
+      }));
+    const schema = {
+      type: "object",
+      additionalProperties: true,
+      required: ["review_status", "score", "issues", "suggestion", "retry_prompt", "should_retry"],
+      properties: {
+        review_status: { type: "string", enum: ["pass", "warning", "fail"] },
+        score: { type: "number" },
+        issues: { type: "array", items: { type: "string" } },
+        suggestion: { type: "string" },
+        retry_prompt: { type: "string" },
+        should_retry: { type: "boolean" },
+      },
+    };
+    const userContent = {
+      task: {
+        id: task.id,
+        title: task.title,
+        productName: task.productName,
+        duration: task.duration,
+        ratio: task.ratio,
+        video: task.video,
+        storyboard: task.storyboard,
+        reviewSummary: task.reviewSummary,
+      },
+      referenceMaterials: productMaterials(product).map((material) => Object.assign({}, material, {
+        dataUrl: material.dataUrl ? "inline image provided" : "",
+      })),
+      generatedFrameCount: generatedFrames.length,
+      frames: referenceFrames.concat(generatedFrames),
+      frameMetadata: {
+        reference: compactFrameMetadata(referenceFrames),
+        generated: compactFrameMetadata(generatedFrames),
+      },
+      reviewChecklist: [
+        "产品主体是否与参考图一致",
+        "颜色、材质、轮廓、比例和关键结构是否跑偏",
+        "Logo、按钮、出水口、水箱、托盘等关键结构是否丢失或变形",
+        "是否出现人物、手部、桌面、背景与产品的严重穿模、融合、断裂或融化",
+        "画面是否适合进入人工视频审核和后续文案生成",
+      ],
+      scoringPolicy: {
+        pass: "80-100：主体一致，没有明显穿模或结构错误。",
+        warning: "60-79：有轻微问题，需要人工确认。",
+        fail: "0-59：产品跑偏、严重穿模、关键结构错误或不适合继续使用。",
+      },
+      outputFields: ["review_status", "score", "issues", "suggestion", "retry_prompt", "should_retry"],
+      outputLanguage: "zh-CN",
+    };
+    return {
+      provider: integration.provider,
+      mode: integration.mode,
+      apiStyle: integration.apiStyle,
+      endpoint: integration.endpoint,
+      model: integration.model,
+      apiKey: integration.apiKey,
+      body: buildLlmBody(
+        integration,
+        "你是电商视频生成质检员。根据产品参考图和生成视频关键帧，判断视频是否与原产品一致。重点检查产品颜色、轮廓、Logo、关键结构、穿模、融合、断裂和明显变形。不要评价营销创意好不好，只判断是否跑偏以及下一次生成该怎么修正。只输出结构化 JSON。",
+        userContent,
+        "video_quality_review",
+        schema
+      ),
     };
   }
 
@@ -2196,6 +2605,15 @@
     if (/没有返回内容|空的流式响应|no content|empty|no usable|message\.content|output_text/.test(text)) {
       return providerIssue("empty_response", "模型无返回", "模型请求成功到达上游，但没有返回可解析的内容。", "重新生成一次；如果连续出现，缩短内容规划、换模型，或检查响应格式是否要求 JSON。", rawMessage);
     }
+    if (/modelnotopen|not activated the model|activate the model|model service|模型未开通|模型没有开通|未开通.*模型|模型服务未开通/.test(text)) {
+      return providerIssue("model_not_open", "模型未开通", "当前视频模型没有在对应 provider 账号里开通，任务没有创建成功。", "到 provider 控制台开通该模型，或在“集成设置”里切换到已开通的视频模型后重试。", rawMessage);
+    }
+    if (/invalidparameter\.bodyformat|invalid ratio|invalid .*ratio|bodyformat|参数格式|请求体格式/.test(text)) {
+      return providerIssue("request_format", "请求参数格式错误", "视频 provider 拒绝了本次请求体，常见原因是比例、分辨率或时长字段不符合当前模型接口要求。", "检查视频比例、分辨率和模型配置；保存配置后重新生成视频。", rawMessage);
+    }
+    if (/image_url|参考图|产品图|图片/.test(text) && /resource not found|not found|无法访问|读取不到|找不到/.test(text)) {
+      return providerIssue("image_resource", "参考图无法访问", "视频模型收到了图片字段，但上游拉取图片资源失败。常见原因是图床防盗链、临时链接失效，或上游网络无法访问该图床。", "系统会优先改用本地上传图的 base64 提交；刷新页面后重新生成视频。若仍失败，请重新上传产品图。", rawMessage);
+    }
     if (status === "video_generating" || /pending|processing|running|in_progress|queued|submitted|生成中|排队/.test(text)) {
       return providerIssue("video_pending", "视频仍在生成", "视频任务已经提交，但上游还没有给出最终视频地址。", "稍后点击“查询视频结果”，不要重复提交同一个视频任务。", rawMessage);
     }
@@ -2251,17 +2669,23 @@
   function normalizeContentPlan(source) {
     const plan = source && typeof source === "object" ? source : {};
     const scenes = Array.isArray(plan.scenes) ? plan.scenes : [];
+    const keySellingPoints = splitList(firstValue(plan, ["keySellingPoints", "key_selling_points", "sellingPoints", "selling_points"], []));
+    const painPoints = splitList(firstValue(plan, ["painPoints", "pain_points", "painpoints"], []));
+    const mainPainPoint = firstValue(plan, ["mainPainPoint", "main_pain_point", "primaryPainPoint", "primary_pain_point"], painPoints[0] || "");
+    const videoThroughline = firstValue(plan, ["videoThroughline", "video_throughline", "storyline", "throughline"], firstValue(plan, ["strategy", "contentStrategy", "content_strategy"], ""));
     return {
       productUnderstanding: firstValue(plan, ["productUnderstanding", "product_understanding", "productSummary", "product_summary"], ""),
       targetAudience: firstValue(plan, ["targetAudience", "target_audience", "audience"], ""),
-      keySellingPoints: splitList(firstValue(plan, ["keySellingPoints", "key_selling_points", "sellingPoints", "selling_points"], [])),
+      keySellingPoints,
+      mainPainPoint,
+      videoThroughline,
       usageScenarios: splitList(firstValue(plan, ["usageScenarios", "usage_scenarios", "scenarios"], [])),
-      painPoints: splitList(firstValue(plan, ["painPoints", "pain_points", "painpoints"], [])),
+      painPoints: painPoints.length ? painPoints : splitList(mainPainPoint),
       contentAngle: firstValue(plan, ["contentAngle", "content_angle", "angle"], ""),
       hookOptions: splitList(firstValue(plan, ["hookOptions", "hook_options", "hooks"], [])),
       coreMessage: firstValue(plan, ["coreMessage", "core_message", "message"], ""),
-      strategy: firstValue(plan, ["strategy", "contentStrategy", "content_strategy"], ""),
-      hook: firstValue(plan, ["hook", "title"], ""),
+      strategy: videoThroughline,
+      hook: firstValue(plan, ["hook", "title"], mainPainPoint),
       visualStyle: firstValue(plan, ["visualStyle", "visual_style", "style"], ""),
       rhythm: firstValue(plan, ["rhythm", "pace", "pacing"], ""),
       mustShow: splitList(firstValue(plan, ["mustShow", "must_show", "requiredVisuals", "required_visuals"], [])),
@@ -2337,7 +2761,7 @@
     task.storyboard = timedScenes;
     task.storyboardTimingStatus = timedScenes.timingStatus;
     task.contentPlan = Object.assign({}, existingPlan, { scenes: timedScenes });
-    ["productUnderstanding", "targetAudience", "keySellingPoints", "usageScenarios", "painPoints", "contentAngle", "hookOptions", "coreMessage", "strategy", "hook", "visualStyle", "rhythm", "mustShow", "mustAvoid", "cta", "storyboardGuidance", "reviewSummary", "complianceNotes"].forEach((field) => {
+    ["productUnderstanding", "targetAudience", "keySellingPoints", "mainPainPoint", "videoThroughline", "usageScenarios", "painPoints", "contentAngle", "hookOptions", "coreMessage", "strategy", "hook", "visualStyle", "rhythm", "mustShow", "mustAvoid", "cta", "storyboardGuidance", "reviewSummary", "complianceNotes"].forEach((field) => {
       if (!hasUsableValue(task.contentPlan[field]) && hasUsableValue(normalized[field])) {
         task.contentPlan[field] = normalized[field];
       }
@@ -2350,8 +2774,12 @@
     if (task.video && task.video.url) return task;
     const responses = task.providerResponses || {};
     const response = responses.videoStatus || responses.video;
-    if (!response) return task;
-    applyVideoProviderResult(task, response);
+    if (response) applyVideoProviderResult(task, response);
+    const missingJobReview = String(task.reviewNote || task.video && task.video.providerMessage || "").includes("本地没有保存视频任务 ID");
+    const shouldRecoverMissingJob = task.status === "video_generating" || (task.status === "rejected" && missingJobReview);
+    if (shouldRecoverMissingJob && !taskJobId(task) && !(task.video && task.video.url)) {
+      markVideoTaskMissingJob(task);
+    }
     return task;
   }
 
@@ -2400,7 +2828,7 @@
   function createContentPlanTask(state, input) {
     const product = getById(state.products, state.selectedProductId);
     const contentPlan = normalizeContentPlan(input && input.contentPlan);
-    if (!hasUsableValue(contentPlan.productUnderstanding) && !hasUsableValue(contentPlan.strategy) && !hasUsableValue(contentPlan.hook)) return null;
+    if (!hasUsableValue(contentPlan.productUnderstanding) && !hasUsableValue(contentPlan.strategy) && !hasUsableValue(contentPlan.hook) && !hasUsableValue(contentPlan.keySellingPoints) && !hasUsableValue(contentPlan.mainPainPoint)) return null;
     contentPlan.scenes = [];
     const now = new Date().toISOString();
     const task = {
@@ -2423,6 +2851,7 @@
       duration: 15,
       ratio: "9:16",
       videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
+      contentPlanSeed: String(state.contentBrief && state.contentBrief.seed || "").trim(),
       contentPlan,
       contentBrief: {
         audienceInsight: contentPlan.targetAudience,
@@ -2457,6 +2886,56 @@
       contentPlan.strategy,
       contentPlan.reviewSummary,
     ].filter(Boolean).join("\n");
+    return task;
+  }
+
+  function createStoryboardTaskFromIdea(state, input = {}) {
+    const product = getById(state.products, state.selectedProductId);
+    const seed = String(state.contentBrief && state.contentBrief.seed || "").trim();
+    const now = new Date().toISOString();
+    const task = {
+      id: uid("task"),
+      productId: product.id,
+      productName: productDisplayName(product),
+      favoriteId: "",
+      favoriteName: "未使用收藏",
+      source: "idea-storyboard",
+      strategy: "direct-storyboard",
+      variation: {
+        hook: seed ? seed.slice(0, 28) : "直接分镜",
+        tone: "真实分镜",
+        angle: "用户想法直接生成",
+      },
+      title: `${productDisplayName(product)} · 直接分镜`,
+      status: "storyboard_ready",
+      owner: "运营",
+      createdAt: now,
+      updatedAt: now,
+      duration: 15,
+      ratio: "9:16",
+      videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
+      contentBrief: {
+        seed,
+        text: seed,
+        painPoint: seed,
+        videoResolution: normalizeVideoResolution(state.contentBrief && state.contentBrief.videoResolution),
+      },
+      strategySummary: "",
+      reviewSummary: "",
+      qualityScore: undefined,
+      storyboard: [],
+      storyboardTimingStatus: "not_started",
+      video: null,
+      reviewNote: "",
+      copies: {},
+      publishResults: {},
+      providerRequests: {},
+      providerResponses: {},
+    };
+    if (input.providerRequest) task.providerRequests.storyboard = input.providerRequest;
+    if (input.providerResponse) task.providerResponses.storyboard = input.providerResponse;
+    state.tasks.unshift(task);
+    state.selectedTaskId = task.id;
     return task;
   }
 
@@ -2779,7 +3258,12 @@
   }
 
   function videoUrlFromProviderResult(result, output) {
-    const direct = result.video_url || result.videoUrl || result.url || output.video_url || output.videoUrl || output.url;
+    const resultContent = result.content && typeof result.content === "object" ? result.content : {};
+    const outputContent = output.content && typeof output.content === "object" ? output.content : {};
+    const direct = result.video_url || result.videoUrl || result.url
+      || output.video_url || output.videoUrl || output.url
+      || resultContent.video_url || resultContent.videoUrl || resultContent.url
+      || outputContent.video_url || outputContent.videoUrl || outputContent.url;
     if (direct) return direct;
     const resultData = result.result && Array.isArray(result.result.data) ? result.result.data : null;
     const outputData = Array.isArray(output.data) ? output.data : null;
@@ -2805,7 +3289,9 @@
       providerCost: result.cost,
       providerResult: result,
     });
-    if (["FAILED", "failed", "CANCELED", "canceled"].includes(providerStatus)) {
+    if (!task.video.url && !task.video.jobId) {
+      markVideoTaskMissingJob(task);
+    } else if (["FAILED", "failed", "CANCELED", "canceled"].includes(providerStatus)) {
       const issue = explainProviderIssue(response || { providerStatus, providerMessage, providerCode }, { kind: "video", status: providerStatus });
       task.reviewNote = `${issue.title}：${issue.action}`;
       setTaskStatus(task, "rejected");
@@ -2814,6 +3300,39 @@
     } else {
       setTaskStatus(task, "video_generating");
     }
+    return true;
+  }
+
+  function normalizeVideoQualityStatus(value, score) {
+    const status = String(value || "").trim().toLowerCase();
+    if (["pass", "passed", "ok", "通过"].includes(status)) return "pass";
+    if (["warning", "warn", "review", "人工确认", "需人工确认"].includes(status)) return "warning";
+    if (["fail", "failed", "reject", "rejected", "不通过"].includes(status)) return "fail";
+    const numericScore = Number(score);
+    if (Number.isFinite(numericScore)) {
+      if (numericScore >= 80) return "pass";
+      if (numericScore >= 60) return "warning";
+      return "fail";
+    }
+    return "warning";
+  }
+
+  function applyVideoQualityReviewProviderResult(task, response) {
+    const result = providerResult(response);
+    if (!result || typeof result !== "object") return false;
+    const score = Math.max(0, Math.min(100, Number(firstValue(result, ["score", "qualityScore", "quality_score"], 0)) || 0));
+    const status = normalizeVideoQualityStatus(firstValue(result, ["review_status", "reviewStatus", "status"], ""), score);
+    const retryPrompt = firstValue(result, ["retry_prompt", "retryPrompt", "nextPrompt"], "");
+    task.videoQualityReview = {
+      status,
+      score,
+      issues: splitList(firstValue(result, ["issues", "problems"], [])),
+      suggestion: firstValue(result, ["suggestion", "advice", "recommendation"], ""),
+      retryPrompt,
+      shouldRetry: Boolean(firstValue(result, ["should_retry", "shouldRetry"], status === "fail")),
+      reviewedAt: new Date().toISOString(),
+    };
+    task.updatedAt = new Date().toISOString();
     return true;
   }
 
@@ -2929,7 +3448,16 @@
   function simulateVideoGeneration(state, task) {
     const product = getById(state.products, task.productId);
     task.providerRequests = task.providerRequests || {};
-    task.providerRequests.video = buildVideoProviderRequest(state, task, product);
+    try {
+      task.providerRequests.video = buildVideoProviderRequest(state, task, product);
+    } catch (error) {
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.video = { ok: false, error: error.message, code: error.code || "" };
+      task.reviewNote = error.message;
+      task.video = null;
+      setTaskStatus(task, "rejected");
+      throw error;
+    }
     task.video = {
       url: "",
       provider: state.integrations.video.provider,
@@ -3185,7 +3713,7 @@
   function taskStatusLabel(status) {
     return {
       content_plan_ready: "内容规划已生成",
-      storyboard_ready: "内容规划已生成",
+      storyboard_ready: "分镜脚本已生成",
       video_generating: "视频生成中",
       video_review: "待视频审核",
       copy_review: "待文案审核",
@@ -3226,6 +3754,7 @@
     getById,
     strategyLabel,
     productImageRoles,
+    productImageRolePurposes,
     productMaterials,
     videoProductMaterials,
     addProductImage,
@@ -3236,11 +3765,13 @@
     normalizeReverseStoryboard,
     buildReverseStoryboardProviderRequest,
     buildStoryboardProviderRequest,
+    buildStoryboardFromIdeaProviderRequest,
     buildStoryboardFromContentPlanProviderRequest,
     buildContentPlanProviderRequest,
     buildContentBriefProviderRequest,
     buildVideoProviderRequest,
     buildVideoStatusProviderRequest,
+    buildVideoQualityReviewProviderRequest,
     buildPublishProviderRequest,
     buildCancelScheduledPostProviderRequest,
     buildRescheduleScheduledPostProviderRequest,
@@ -3254,12 +3785,14 @@
     applyReverseStoryboardProviderResult,
     applyStoryboardProviderResult,
     applyVideoProviderResult,
+    applyVideoQualityReviewProviderResult,
     applyCopyProviderResult,
     applyPublishProviderResult,
     applyScheduledPostProviderResult,
     applyCancelScheduledPostProviderResult,
     applyRescheduleScheduledPostProviderResult,
     createContentPlanTask,
+    createStoryboardTaskFromIdea,
     reverseStoryboardText,
     saveReverseStoryboardFavorite,
     createTasksFromReverseFavorite,

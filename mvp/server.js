@@ -7,6 +7,21 @@ const ROOT = __dirname;
 const OUTPUTS_ROOT = path.resolve(process.env.AI_VIDEO_OUTPUTS_ROOT || path.join(ROOT, "..", "outputs"));
 const PORT = Number(process.env.PORT || 4188);
 
+function loadLocalEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match || process.env[match[1]] !== undefined) return;
+    const rawValue = match[2].trim();
+    process.env[match[1]] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
+  });
+}
+
+[path.join(ROOT, "..", ".env"), path.join(ROOT, "..", ".env.local")].forEach(loadLocalEnvFile);
+
 const types = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -20,6 +35,86 @@ const types = {
   ".mov": "video/quicktime",
   ".webm": "video/webm",
 };
+
+function publicUploadBaseUrl() {
+  const raw = String(process.env.AI_VIDEO_PUBLIC_UPLOAD_BASE_URL || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return "";
+    if (!url.pathname.endsWith("/")) url.pathname += "/";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function publicUrlForOutputPath(outputUrl) {
+  const base = publicUploadBaseUrl();
+  const value = String(outputUrl || "").trim();
+  if (!base || !value.startsWith("/outputs/")) return "";
+  const relative = value.replace(/^\/outputs\/+/, "");
+  const encodedRelative = relative.split("/").map((part) => encodeURIComponent(part)).join("/");
+  return new URL(encodedRelative, base).toString();
+}
+
+function imageHostProvider() {
+  return String(process.env.IMAGE_HOST_PROVIDER || "").trim().toLowerCase();
+}
+
+function imgbbUploadEndpoint() {
+  return String(process.env.IMGBB_UPLOAD_ENDPOINT || "https://api.imgbb.com/1/upload").trim();
+}
+
+function directHostedImageUrl(data) {
+  const candidates = [
+    data && data.data && data.data.image && data.data.image.url,
+    data && data.data && data.data.url,
+    data && data.data && data.data.display_url,
+    data && data.image && data.image.url,
+    data && data.url,
+  ];
+  return candidates.map((item) => String(item || "").trim()).find((item) => /^https:\/\//i.test(item)) || "";
+}
+
+async function uploadImageToImgBB(bytes, fileName, contentType) {
+  const apiKey = String(process.env.IMGBB_API_KEY || "").trim();
+  if (!apiKey) throw new Error("请先配置 IMGBB_API_KEY，才能把产品图上传到 ImgBB。");
+  const endpoint = imgbbUploadEndpoint();
+  const url = new URL(endpoint);
+  url.searchParams.set("key", apiKey);
+  const formData = new FormData();
+  formData.append("image", new Blob([bytes], { type: contentType || "image/png" }), fileName || "product-image.png");
+  const response = await fetch(url, { method: "POST", body: formData });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+  if (!response.ok || !data || data.success === false) {
+    const message = data && (data.error && data.error.message || data.message) || `ImgBB 上传失败，HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  const publicUrl = directHostedImageUrl(data);
+  if (!publicUrl) {
+    throw new Error("ImgBB 没有返回可供模型访问的 HTTPS 图片直链。");
+  }
+  return {
+    publicUrl,
+    imageHostProvider: "imgbb",
+    modelVisible: true,
+    response: data,
+  };
+}
+
+async function hostUploadedImage(bytes, fileName, contentType, localUrl) {
+  if (imageHostProvider() === "imgbb") {
+    return uploadImageToImgBB(bytes, fileName, contentType);
+  }
+  const publicUrl = publicUrlForOutputPath(localUrl);
+  return publicUrl ? { publicUrl, modelVisible: true, imageHostProvider: "public-base-url" } : null;
+}
 
 function sendJson(res, status, data) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -442,6 +537,52 @@ function redactProxyData(data) {
   return { summary: text.slice(0, 2000), truncated: true };
 }
 
+function localOutputPathFromUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw.startsWith("/outputs/")) return "";
+  try {
+    const relative = raw.replace(/^\/outputs\/+/, "").split("/").map((part) => decodeURIComponent(part)).join(path.sep);
+    const resolved = path.resolve(OUTPUTS_ROOT, relative);
+    return resolved.startsWith(OUTPUTS_ROOT + path.sep) ? resolved : "";
+  } catch {
+    return "";
+  }
+}
+
+function dataUrlFromLocalOutput(value) {
+  const filePath = localOutputPathFromUrl(value);
+  if (!filePath || !fs.existsSync(filePath)) return "";
+  const mimeType = mimeFromFilename(filePath);
+  if (!/^image\//i.test(mimeType)) return "";
+  const bytes = fs.readFileSync(filePath);
+  return `data:${mimeType};base64,${bytes.toString("base64")}`;
+}
+
+function prepareOfficialJimengRequest(providerRequest) {
+  if (!isOfficialJimengProviderRequest(providerRequest)) return providerRequest;
+  const method = String(providerRequest && providerRequest.method || "POST").toUpperCase();
+  if (["GET", "HEAD", "DELETE"].includes(method)) return providerRequest;
+  const content = providerRequest && providerRequest.body && providerRequest.body.content;
+  if (!Array.isArray(content)) return providerRequest;
+  const body = { ...providerRequest.body };
+  body.content = content.map((part) => {
+    if (!part || part.type !== "image_url") return part;
+    const imageUrl = typeof part.image_url === "string"
+      ? { url: part.image_url }
+      : { ...(part.image_url || {}) };
+    const localUrl = imageUrl.local_url || imageUrl.localUrl || part.local_url || part.localUrl || "";
+    const localDataUrl = dataUrlFromLocalOutput(localUrl);
+    if (localDataUrl) imageUrl.url = localDataUrl;
+    delete imageUrl.local_url;
+    delete imageUrl.localUrl;
+    const nextPart = { ...part, image_url: imageUrl };
+    delete nextPart.local_url;
+    delete nextPart.localUrl;
+    return nextPart;
+  });
+  return { ...providerRequest, body };
+}
+
 function upstreamErrorMessage(proxied) {
   const data = proxied && proxied.data;
   if (!data || typeof data !== "object") return "";
@@ -512,13 +653,13 @@ function isImageUpload(contentType, filename) {
 
 function uploadUrlToPath(urlPath) {
   const value = String(urlPath || "");
-  if (!value.startsWith("/outputs/uploads/")) {
-    throw new Error("没有找到已上传的视频。");
+  if (!value.startsWith("/outputs/uploads/") && !value.startsWith("/outputs/downloads/")) {
+    throw new Error("没有找到本地视频。");
   }
   const relative = value.slice("/outputs/".length);
   const filePath = path.normalize(path.join(OUTPUTS_ROOT, relative));
   if (!isInside(OUTPUTS_ROOT, filePath)) {
-    throw new Error("没有找到已上传的视频。");
+    throw new Error("没有找到本地视频。");
   }
   return filePath;
 }
@@ -800,6 +941,12 @@ async function handleImageUpload(req, res, url) {
       size: body.length,
       uploadedAt: new Date().toISOString(),
     };
+    const hosted = await hostUploadedImage(body, fileName, upload.mimeType, upload.url);
+    if (hosted && hosted.publicUrl) {
+      upload.publicUrl = hosted.publicUrl;
+      upload.modelVisible = true;
+      upload.imageHostProvider = hosted.imageHostProvider || "";
+    }
     sendJson(res, 200, { ok: true, upload });
   } catch (error) {
     sendJson(res, 400, { ok: false, error: error.message });
@@ -808,6 +955,10 @@ async function handleImageUpload(req, res, url) {
 
 function ffmpegCommand() {
   return process.env.AI_VIDEO_FFMPEG_PATH || "ffmpeg";
+}
+
+function ffprobeCommand() {
+  return process.env.AI_VIDEO_FFPROBE_PATH || "ffprobe";
 }
 
 function ffmpegAvailable() {
@@ -1006,13 +1157,19 @@ function extractLlmUserContent(providerRequest) {
 
 function providerRequestSummary(providerRequest) {
   const body = providerRequest && providerRequest.body || {};
+  const parameters = body.parameters || {};
   let imagePartCount = 0;
+  let imageUrlCount = 0;
+  let referenceImageCount = 0;
   let textPayload = null;
   if (Array.isArray(body.messages)) {
     body.messages.forEach((message) => {
       if (Array.isArray(message.content)) {
         message.content.forEach((part) => {
-          if (part && part.type === "image_url") imagePartCount += 1;
+          if (part && part.type === "image_url") {
+            imagePartCount += 1;
+            imageUrlCount += 1;
+          }
           if (part && part.type === "text" && !textPayload) textPayload = parseMaybeJson(part.text);
         });
       } else if (message && message.role === "user") {
@@ -1020,20 +1177,183 @@ function providerRequestSummary(providerRequest) {
       }
     });
   }
+  if (Array.isArray(body.content)) {
+    body.content.forEach((part) => {
+      if (part && part.type === "image_url" && part.image_url && part.image_url.url) {
+        imageUrlCount += 1;
+      }
+      if (part && part.type === "text" && !textPayload) textPayload = parseMaybeJson(part.text);
+    });
+  }
+  if (Array.isArray(body.image_urls)) {
+    imageUrlCount += body.image_urls.filter(Boolean).length;
+  }
+  if (body.input && Array.isArray(body.input.media)) {
+    imageUrlCount += body.input.media.filter((item) => item && item.url).length;
+  }
+  referenceImageCount = Number(parameters.reference_image_count || 0) || imageUrlCount;
   if (!textPayload) textPayload = extractLlmUserContent(providerRequest);
   return {
     imagePartCount,
+    imageUrlCount,
+    referenceImageCount,
+    duration: body.duration !== undefined ? body.duration : parameters.duration,
+    topLevelDuration: body.duration,
+    parameterDuration: parameters.duration,
+    ratio: body.ratio || parameters.ratio || body.aspect_ratio || parameters.aspect_ratio || "",
+    resolution: body.resolution || parameters.resolution || "",
+    requiresReferenceImage: Boolean(providerRequest && providerRequest.requiresReferenceImage),
     inlineFrameImageCount: Number(textPayload && textPayload.inlineFrameImageCount || 0),
     visualInputMode: textPayload && textPayload.visualInputMode || "",
     frameCount: Array.isArray(textPayload && textPayload.frames) ? textPayload.frames.length : 0,
   };
 }
 
+function missingReferenceImageMessage(providerRequest, summary) {
+  const validation = providerRequest && providerRequest.referenceImageValidation || {};
+  const reason = validation.missingReason || "请求体里没有可被模型访问的 image_url / image_urls。";
+  return `模型没有收到产品图链接：${reason} 请先上传到 ImgBB/公网图床，或填写公网 HTTPS 图片链接后再生成视频。`;
+}
+
+function isOfficialJimengProviderRequest(providerRequest) {
+  if (!providerRequest) return false;
+  return providerRequest.apiStyle === "jimeng-seedance-official" ||
+    providerRequest.provider === "jimeng-seedance-official";
+}
+
+function assertOfficialJimengContentRoles(providerRequest) {
+  if (!isOfficialJimengProviderRequest(providerRequest)) return;
+  const method = String(providerRequest && providerRequest.method || "POST").toUpperCase();
+  if (["GET", "HEAD", "DELETE"].includes(method)) return;
+  const content = providerRequest && providerRequest.body && providerRequest.body.content;
+  if (!Array.isArray(content)) return;
+  const missingRole = content.find((part) => part && part.type === "image_url" && !part.role);
+  const invalidRole = content.find((part) =>
+    part && part.type === "image_url" && part.role && !["first_frame", "last_frame", "reference_image"].includes(part.role)
+  );
+  if (!missingRole && !invalidRole) return;
+  const error = new Error(missingRole
+    ? "官方即梦请求体不完整：image content 必须带 role 字段。请刷新页面后重新生成视频。"
+    : "官方即梦请求体不完整：多模态参考图的 image content role 必须是 reference_image。请刷新页面后重新生成视频。");
+  error.code = missingRole ? "JIMENG_IMAGE_CONTENT_ROLE_MISSING" : "JIMENG_IMAGE_CONTENT_ROLE_INVALID";
+  throw error;
+}
+
+function assertProviderReferenceImages(kind, providerRequest, summary) {
+  if (kind !== "video") return;
+  const method = String(providerRequest && providerRequest.method || "POST").toUpperCase();
+  if (["GET", "HEAD", "DELETE"].includes(method)) return;
+  const requiresReferenceImage = providerRequest && (
+    isOfficialJimengProviderRequest(providerRequest) ||
+    providerRequest.requiresReferenceImage === true ||
+    providerRequest.referenceImageValidation && providerRequest.referenceImageValidation.required === true
+  );
+  if (!requiresReferenceImage) return;
+  if (summary && Number(summary.imageUrlCount || 0) > 0) return;
+  const error = new Error(missingReferenceImageMessage(providerRequest, summary));
+  error.code = "MODEL_REFERENCE_IMAGE_MISSING";
+  throw error;
+}
+
+function findStringUrl(value) {
+  if (typeof value === "string" && /^https?:\/\//i.test(value)) return value;
+  return "";
+}
+
+function providerVideoUrl(data) {
+  if (!data || typeof data !== "object") return "";
+  const direct = findStringUrl(data.video_url) || findStringUrl(data.videoUrl) || findStringUrl(data.url);
+  if (direct) return direct;
+  const content = data.content || {};
+  const contentUrl = findStringUrl(content.video_url) || findStringUrl(content.videoUrl) || findStringUrl(content.url);
+  if (contentUrl) return contentUrl;
+  const output = data.output || {};
+  const outputUrl = findStringUrl(output.video_url) || findStringUrl(output.videoUrl) || findStringUrl(output.url);
+  if (outputUrl) return outputUrl;
+  const candidates = [
+    ...(Array.isArray(data.data) ? data.data : []),
+    ...(Array.isArray(data.result) ? data.result : []),
+    ...(Array.isArray(output.videos) ? output.videos : []),
+  ];
+  for (const item of candidates) {
+    const itemUrl = item && (findStringUrl(item.video_url) || findStringUrl(item.videoUrl) || findStringUrl(item.url));
+    if (itemUrl) return itemUrl;
+  }
+  return "";
+}
+
+function providerStatusSucceeded(data) {
+  const status = String(data && (data.status || data.state || data.task_status || data.providerStatus) || "").toLowerCase();
+  if (!status) return true;
+  return ["succeeded", "success", "completed", "done", "finished"].includes(status);
+}
+
+function expectedVideoDuration(providerRequest) {
+  const duration = Number(
+    providerRequest && (
+      providerRequest.expectedDuration ||
+      providerRequest.duration && providerRequest.duration.submitted ||
+      providerRequest.body && providerRequest.body.parameters && providerRequest.body.parameters.duration ||
+      providerRequest.body && providerRequest.body.duration
+    )
+  );
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function shouldValidateProviderVideoDuration(kind, providerRequest, proxied) {
+  const method = String(providerRequest && providerRequest.method || "POST").toUpperCase();
+  if (kind !== "video" || method !== "GET") return false;
+  if (!isOfficialJimengProviderRequest(providerRequest)) return false;
+  if (!proxied || !proxied.ok || !providerStatusSucceeded(proxied.data)) return false;
+  if (!expectedVideoDuration(providerRequest)) return false;
+  return Boolean(providerVideoUrl(proxied.data));
+}
+
+function probeVideoDurationSeconds(url) {
+  const result = spawnSync(ffprobeCommand(), [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    url,
+  ], { encoding: "utf8", timeout: 30000 });
+  if (result.error) {
+    throw new Error(`视频时长检测失败：${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || "").split("\n").slice(-3).join(" ").trim();
+    throw new Error(`视频时长检测失败：${stderr || `ffprobe exit ${result.status}`}`);
+  }
+  const duration = Number(String(result.stdout || "").trim().split(/\s+/)[0]);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error("视频时长检测失败：ffprobe 没有返回有效时长。");
+  }
+  return duration;
+}
+
+function validateProviderVideoDuration(kind, providerRequest, proxied) {
+  if (!shouldValidateProviderVideoDuration(kind, providerRequest, proxied)) return proxied;
+  const expected = expectedVideoDuration(providerRequest);
+  const actual = probeVideoDurationSeconds(providerVideoUrl(proxied.data));
+  const tolerance = 0.75;
+  if (actual < expected - tolerance) {
+    const error = new Error(`视频时长不符合要求：期望 ${expected}s，实际 ${actual.toFixed(2)}s。上游没有按 15 秒出片，请重新生成或检查官方即梦模型/账号是否支持 15 秒。`);
+    error.code = "VIDEO_DURATION_MISMATCH";
+    throw error;
+  }
+  proxied.data = Object.assign({}, proxied.data, {
+    durationCheck: {
+      expectedSeconds: expected,
+      actualSeconds: Number(actual.toFixed(3)),
+    },
+  });
+  return proxied;
+}
+
 async function handleProvider(req, res, kind) {
   let providerRequest = null;
   try {
     const payload = await readBody(req);
-    providerRequest = payload.providerRequest || payload;
+    providerRequest = prepareOfficialJimengRequest(payload.providerRequest || payload);
     const baseEvent = {
       kind,
       provider: providerRequest.provider,
@@ -1041,13 +1361,16 @@ async function handleProvider(req, res, kind) {
       endpoint: providerRequest.endpoint || "",
       method: providerRequest.method || (providerRequest.mode === "http" ? "POST" : "MOCK"),
     };
+    const summary = providerRequestSummary(providerRequest);
     logProviderEvent({
       ...baseEvent,
       phase: "request",
       model: providerRequest.model || providerRequest.body?.model || "",
       postCount: providerRequest.body?.posts?.length || 0,
-      requestSummary: providerRequestSummary(providerRequest),
+      requestSummary: summary,
     });
+    assertProviderReferenceImages(kind, providerRequest, summary);
+    assertOfficialJimengContentRoles(providerRequest);
     if (providerRequest.mode !== "http") {
       throw new Error("non-http provider mode has been removed; configure a real HTTP provider.");
     }
@@ -1063,20 +1386,37 @@ async function handleProvider(req, res, kind) {
           error: retry.error,
         }),
       }) : await proxyHttp(providerRequest);
+      let finalProxied = proxied;
+      try {
+        finalProxied = validateProviderVideoDuration(kind, providerRequest, proxied);
+      } catch (durationError) {
+        finalProxied = {
+          status: proxied.status,
+          ok: false,
+          attempts: proxied.attempts || 1,
+          data: {
+            error: {
+              code: durationError.code || "VIDEO_DURATION_CHECK_FAILED",
+              message: durationError.message,
+            },
+            upstream: proxied.data,
+          },
+        };
+      }
       logProviderEvent({
         ...baseEvent,
         phase: "response",
-        ok: proxied.ok,
-        status: proxied.status,
-        attempts: proxied.attempts || 1,
-        data: redactProxyData(proxied.data),
+        ok: finalProxied.ok,
+        status: finalProxied.status,
+        attempts: finalProxied.attempts || 1,
+        data: redactProxyData(finalProxied.data),
       });
-      sendJson(res, proxied.ok ? 200 : 502, {
-        ok: proxied.ok,
+      sendJson(res, finalProxied.ok ? 200 : 502, {
+        ok: finalProxied.ok,
         mode: "http",
         provider: providerRequest.provider,
-        error: proxied.ok ? undefined : retryAwareFailureMessage(proxied),
-        upstream: proxied,
+        error: finalProxied.ok ? undefined : retryAwareFailureMessage(finalProxied),
+        upstream: finalProxied,
       });
       return;
     }
@@ -1251,6 +1591,10 @@ function createServer() {
       handleProvider(req, res, "video");
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/provider/video-quality-review") {
+      handleProvider(req, res, "video-quality-review");
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/api/provider/copy") {
       handleProvider(req, res, "copy");
       return;
@@ -1273,4 +1617,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, ffmpegCommand };
+module.exports = { createServer, ffmpegCommand, ffprobeCommand };

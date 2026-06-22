@@ -4,12 +4,38 @@ const os = require("os");
 const path = require("path");
 
 const {
+  applyBundledImageHostDefaults,
   appUrl,
   desktopDataPaths,
   startMvpServer,
 } = require("./runtime");
 
 async function main() {
+  const originalImageHostProvider = process.env.IMAGE_HOST_PROVIDER;
+  const originalImgbbApiKey = process.env.IMGBB_API_KEY;
+  const originalImgbbUploadEndpoint = process.env.IMGBB_UPLOAD_ENDPOINT;
+
+  delete process.env.IMAGE_HOST_PROVIDER;
+  delete process.env.IMGBB_API_KEY;
+  delete process.env.IMGBB_UPLOAD_ENDPOINT;
+  applyBundledImageHostDefaults();
+  assert.strictEqual(process.env.IMAGE_HOST_PROVIDER, "imgbb", "desktop runtime bundles ImgBB hosting by default");
+  assert.ok(process.env.IMGBB_API_KEY, "desktop runtime bundles an ImgBB key for operators");
+  assert.strictEqual(process.env.IMGBB_UPLOAD_ENDPOINT, "https://api.imgbb.com/1/upload", "desktop runtime bundles the ImgBB upload endpoint");
+
+  process.env.IMAGE_HOST_PROVIDER = "custom-host";
+  process.env.IMGBB_API_KEY = "external-key";
+  applyBundledImageHostDefaults();
+  assert.strictEqual(process.env.IMAGE_HOST_PROVIDER, "custom-host", "external image host provider is not overwritten");
+  assert.strictEqual(process.env.IMGBB_API_KEY, "external-key", "external ImgBB key is not overwritten");
+
+  if (originalImageHostProvider === undefined) delete process.env.IMAGE_HOST_PROVIDER;
+  else process.env.IMAGE_HOST_PROVIDER = originalImageHostProvider;
+  if (originalImgbbApiKey === undefined) delete process.env.IMGBB_API_KEY;
+  else process.env.IMGBB_API_KEY = originalImgbbApiKey;
+  if (originalImgbbUploadEndpoint === undefined) delete process.env.IMGBB_UPLOAD_ENDPOINT;
+  else process.env.IMGBB_UPLOAD_ENDPOINT = originalImgbbUploadEndpoint;
+
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ai-video-desktop-"));
   const paths = desktopDataPaths(tempRoot);
 

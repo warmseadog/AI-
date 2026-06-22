@@ -33,6 +33,36 @@ function loadState() {
   }
 }
 
+function sameIntegrationProfileTarget(profile, candidate) {
+  const profileConfig = profile && profile.config || {};
+  const candidateConfig = candidate && candidate.config || candidate || {};
+  if (profile && candidate && profile.id && candidate.id && profile.id === candidate.id) return true;
+  return Boolean(
+    profileConfig.provider &&
+    profileConfig.provider === candidateConfig.provider &&
+    profileConfig.apiStyle === candidateConfig.apiStyle &&
+    profileConfig.model === candidateConfig.model &&
+    profileConfig.endpoint === candidateConfig.endpoint
+  );
+}
+
+function hydrateLocalProfileSecrets(localProfiles, existingProfiles, existingIntegration) {
+  return localProfiles.map((profile) => {
+    if (!profile || !profile.config || profile.config.apiKey) return profile;
+    const savedProfile = existingProfiles.find((candidate) =>
+      candidate && candidate.config && candidate.config.apiKey && sameIntegrationProfileTarget(profile, candidate)
+    );
+    let apiKey = savedProfile && savedProfile.config && savedProfile.config.apiKey || "";
+    if (!apiKey && existingIntegration && existingIntegration.apiKey && sameIntegrationProfileTarget(profile, { config: existingIntegration })) {
+      apiKey = existingIntegration.apiKey;
+    }
+    if (!apiKey) return profile;
+    return Object.assign({}, profile, {
+      config: Object.assign({}, profile.config, { apiKey }),
+    });
+  });
+}
+
 function applyLocalConfig(nextState) {
   const localConfig = window.AI_VIDEO_LOCAL_CONFIG;
   if (!localConfig || typeof localConfig !== "object") return nextState;
@@ -48,8 +78,9 @@ function applyLocalConfig(nextState) {
       const localProfiles = Array.isArray(localConfig.integrationProfiles[key]) ? localConfig.integrationProfiles[key] : [];
       if (!localProfiles.length) return;
       const existingProfiles = Array.isArray(nextState.integrationProfiles[key]) ? nextState.integrationProfiles[key] : [];
-      const localIds = new Set(localProfiles.map((profile) => profile.id).filter(Boolean));
-      nextState.integrationProfiles[key] = localProfiles.concat(existingProfiles.filter((profile) => !localIds.has(profile.id)));
+      const hydratedLocalProfiles = hydrateLocalProfileSecrets(localProfiles, existingProfiles, nextState.integrations && nextState.integrations[key]);
+      const localIds = new Set(hydratedLocalProfiles.map((profile) => profile.id).filter(Boolean));
+      nextState.integrationProfiles[key] = hydratedLocalProfiles.concat(existingProfiles.filter((profile) => !localIds.has(profile.id)));
     });
   }
   if (localConfig.activeIntegrationProfileIds && typeof localConfig.activeIntegrationProfileIds === "object") {
@@ -59,7 +90,12 @@ function applyLocalConfig(nextState) {
     const valid = new Set(Core.platforms.map((platform) => platform.id));
     nextState.selectedPlatforms = localConfig.selectedPlatforms.filter((id) => valid.has(id));
   }
-  return Core.migrateState(nextState);
+  const migrated = Core.migrateState(nextState);
+  ["llm", "video", "publisher"].forEach((key) => {
+    const profileId = migrated.activeIntegrationProfileIds && migrated.activeIntegrationProfileIds[key];
+    if (profileId) Core.applyIntegrationProfile(migrated, key, profileId);
+  });
+  return Core.migrateState(migrated);
 }
 
 function saveState() {
@@ -79,7 +115,7 @@ function streamLogStatusClass(kind, status) {
 function streamLogText(kind, streamState) {
   const stateForDisplay = streamState || {};
   if (kind === "content-plan" && stateForDisplay.status === "streaming") {
-    return "模型正在后台生成内容规划，结果会在完成后写入内容规划框。你可以继续查看或编辑分镜脚本。";
+    return "模型正在后台生成内容规划，完成后会继续生成分镜脚本。";
   }
   return stateForDisplay.text || (kind === "storyboard" ? "生成分镜时，这里会显示模型返回过程。" : "生成内容规划时，这里会显示模型返回过程。");
 }
@@ -578,8 +614,6 @@ function storyboardScriptText(task) {
       scene.camera || scene.motion ? `运镜/动作：${[scene.camera, scene.motion].filter(Boolean).join("；")}` : "",
       scene.productFocus ? `产品重点：${scene.productFocus}` : "",
       scene.videoPrompt ? `视频提示词：${scene.videoPrompt}` : "",
-      scene.reviewChecklist?.length ? `审核点：${listText(scene.reviewChecklist)}` : "",
-      scene.riskNotes?.length ? `风险提示：${listText(scene.riskNotes)}` : "",
     ].filter(Boolean).join("\n")),
   ].join("\n\n");
 }
@@ -1001,6 +1035,66 @@ async function uploadProductImageFile(file) {
   return uploadProductImageBlob(file, file.name || "product-image.png");
 }
 
+function isHttpImageUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim());
+}
+
+function isModelVisibleImageError(error) {
+  const message = String(error && error.message || error || "");
+  return /模型无法接收产品图|模型没有收到产品图|IMGBB_API_KEY|公网|publicUrl|HTTPS 图片/.test(message);
+}
+
+function modelVisibleImagePreflightMessage(error) {
+  const raw = String(error && error.message || error || "");
+  if (/IMGBB_API_KEY/.test(raw)) {
+    return "需要先配置 ImgBB 图床：当前产品图只有本地文件，视频模型访问不到。配置 IMGBB_API_KEY 后再生成视频，分镜已保留。";
+  }
+  return "需要公网产品图：当前产品图只有本地路径或本地上传数据，视频模型无法访问。请先配置 ImgBB/公网图床，或填写公网 HTTPS 图片链接后再生成视频，分镜已保留。";
+}
+
+function productHasModelVisibleVideoImage(product) {
+  if (!product) return false;
+  if (isHttpImageUrl(product.imageUrl)) return true;
+  return (Array.isArray(product.images) ? product.images : []).some((image) => {
+    if (!image || image.useForVideo === false) return false;
+    return isHttpImageUrl(image.publicUrl || image.url);
+  });
+}
+
+function productImageUploadFilename(image, index) {
+  const source = String(image && (image.fileName || image.label || image.url) || "").trim();
+  const tail = source.split("/").filter(Boolean).pop() || `product-reference-${index + 1}.png`;
+  const label = safeImageLabel(tail, `product-reference-${index + 1}`);
+  const extension = /\.[a-z0-9]{2,5}$/i.test(tail) ? tail.match(/\.[a-z0-9]{2,5}$/i)[0] : ".png";
+  return `${label}${extension}`;
+}
+
+async function ensureProductImagesHostedForVideo(product) {
+  if (!product || !isServerMode() || productHasModelVisibleVideoImage(product)) return;
+  const images = Array.isArray(product.images) ? product.images : [];
+  for (let index = 0; index < images.length; index += 1) {
+    const image = images[index];
+    if (!image || image.useForVideo === false || isHttpImageUrl(image.publicUrl || image.url)) continue;
+    let blob = null;
+    if (image.url) {
+      const response = await fetch(image.url);
+      if (response.ok) blob = await response.blob();
+    } else if (image.dataUrl) {
+      const response = await fetch(image.dataUrl);
+      blob = await response.blob();
+    }
+    if (!blob) continue;
+    const upload = await uploadProductImageBlob(blob, productImageUploadFilename(image, index));
+    if (upload.publicUrl) {
+      image.publicUrl = upload.publicUrl;
+      image.modelVisible = true;
+      image.type = "hosted";
+      if (!image.url && upload.url) image.url = upload.url;
+      if (!isHttpImageUrl(product.imageUrl)) product.imageUrl = upload.publicUrl;
+    }
+  }
+}
+
 async function uploadLegacyProductImageIfNeeded(product) {
   if (!product || !product.imageData || (Array.isArray(product.images) && product.images.length)) return;
   if (!isServerMode()) return;
@@ -1009,8 +1103,10 @@ async function uploadLegacyProductImageIfNeeded(product) {
   const label = safeImageLabel(product.imageLabel, "上传产品图");
   const upload = await uploadProductImageBlob(blob, `${label || "product-image"}.png`);
   Core.addProductImage(product, {
-    type: "url",
+    type: upload.publicUrl ? "hosted" : "url",
     url: upload.url,
+    publicUrl: upload.publicUrl || "",
+    modelVisible: Boolean(upload.modelVisible),
     label,
     role: "主图",
     useForVideo: true,
@@ -1033,11 +1129,13 @@ async function handleProductReferenceImagesUpload(input, files) {
   uploads.forEach((upload, index) => {
     const file = imageFiles[index];
     Core.addProductImage(product, {
-      type: upload.url ? "url" : "upload",
+      type: upload.publicUrl ? "hosted" : (upload.url ? "url" : "upload"),
       url: upload.url || "",
+      publicUrl: upload.publicUrl || "",
+      modelVisible: Boolean(upload.modelVisible),
       dataUrl: upload.dataUrl || "",
       label: safeImageLabel(file.name, "上传产品图"),
-      role: product.images && product.images.length ? "细节" : "主图",
+      role: productImageFallbackRole(product.images && product.images.length || 0),
       useForVideo: true,
     });
   });
@@ -1258,6 +1356,25 @@ async function extractReverseFrames(upload) {
   return data.frames || [];
 }
 
+async function extractGeneratedVideoFrames(task) {
+  if (!isServerMode()) {
+    throw new Error("抽帧需要先启动本地服务。");
+  }
+  if (!task.video || !task.video.localUrl) {
+    await downloadGeneratedVideo(task);
+  }
+  const response = await fetch("/api/video/frames", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uploadId: task.id, url: task.video.localUrl, count: 3 }),
+  });
+  const data = await response.json();
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || "视频抽帧失败。");
+  }
+  return data.frames || [];
+}
+
 function shouldInlineReverseFrames() {
   // Set LLM apiStyle to "openai-vision-chat" for frame-aware reverse reconstruction.
   const integration = state.integrations?.llm || {};
@@ -1365,8 +1482,8 @@ function renderDashboard() {
   return `
     <section>
       <div class="section-head">
-        <div><h1>视频任务看板</h1><p class="muted">从真实内容规划开始，追踪视频生成、审核、文案和发布状态。</p></div>
-        <button class="button primary" data-view="create">新建内容规划</button>
+        <div><h1>视频任务看板</h1><p class="muted">从真实分镜脚本开始，追踪视频生成、审核、文案和发布状态。</p></div>
+        <button class="button primary" data-view="create">新建分镜脚本</button>
       </div>
       <div class="dashboard-date-bar" aria-label="任务时间筛选">
         <div class="segmented-control">
@@ -1414,7 +1531,7 @@ function renderDashboard() {
           <div class="dashboard-task-board">
             ${visibleTasks.length
               ? visibleTasks.map(renderDashboardTaskCard).join("")
-              : `<div class="empty-list"><strong>${state.tasks.length ? "当前筛选下没有任务。" : "还没有任务。"}</strong><p class="muted">${state.tasks.length ? "换一个时间范围或队列查看。" : "先输入产品想法和产品图，生成一条真实内容规划。"}</p></div>`}
+              : `<div class="empty-list"><strong>${state.tasks.length ? "当前筛选下没有任务。" : "还没有任务。"}</strong><p class="muted">${state.tasks.length ? "换一个时间范围或队列查看。" : "先输入视频想法和产品图，生成一条真实分镜脚本。"}</p></div>`}
           </div>
           ${renderDashboardDetailDrawer(detailTask)}
         </div>
@@ -1424,7 +1541,21 @@ function renderDashboard() {
 }
 
 function latestContentPlanTask() {
-  return state.tasks.find((task) => task.status === "content_plan_ready") || selectedTask();
+  const selected = selectedTask();
+  if (selected && ["content_plan_ready", "storyboard_ready"].includes(selected.status)) return selected;
+  return state.tasks.find((task) => ["storyboard_ready", "content_plan_ready"].includes(task.status)) || selected;
+}
+
+function contentPlanSeedSnapshot(task) {
+  return String(task && (task.contentBrief?.seed || task.contentPlanSeed || task.seed || "") || "").trim();
+}
+
+function currentContentPlanSeed() {
+  return String(state.contentBrief?.seed || "").trim();
+}
+
+function hasFreshContentPlan(task) {
+  return Boolean(task && task.contentPlan && contentPlanSeedSnapshot(task) === currentContentPlanSeed());
 }
 
 function readablePlanValue(value) {
@@ -1443,23 +1574,14 @@ function planArrayValue(value) {
 }
 
 function contentPlanTextFromPlan(plan) {
+  const mainPainPoint = plan.mainPainPoint || (Array.isArray(plan.painPoints) ? plan.painPoints[0] : plan.painPoints);
+  const videoThroughline = plan.videoThroughline || plan.strategy || plan.coreMessage;
   const sections = [
-    ["产品理解", plan.productUnderstanding],
-    ["目标用户", plan.targetAudience],
-    ["内容角度", plan.contentAngle],
-    ["核心信息", plan.coreMessage],
-    ["内容策略", plan.strategy],
-    ["主开头钩子", plan.hook],
-    ["视觉风格", plan.visualStyle],
-    ["视频节奏", plan.rhythm],
-    ["结尾 CTA", plan.cta],
-    ["核心痛点", planArrayValue(plan.painPoints)],
-    ["使用场景", planArrayValue(plan.usageScenarios)],
-    ["主要卖点", planArrayValue(plan.keySellingPoints)],
-    ["开头钩子备选", planArrayValue(plan.hookOptions)],
+    ["核心卖点", planArrayValue((plan.keySellingPoints || []).slice ? plan.keySellingPoints.slice(0, 3) : plan.keySellingPoints)],
+    ["主痛点", mainPainPoint],
+    ["视频主线", videoThroughline],
     ["必须出现的画面", planArrayValue(plan.mustShow)],
-    ["禁止夸大的内容", planArrayValue(plan.mustAvoid)],
-    ["合规提醒", planArrayValue(plan.complianceNotes)],
+    ["禁止偏离", planArrayValue(plan.mustAvoid)],
   ].filter(([, value]) => String(value || "").trim());
   return sections.map(([label, value]) => `# ${label}\n${readablePlanValue(value)}`).join("\n\n");
 }
@@ -1496,37 +1618,6 @@ function renderContentPlanGenerationLog(streamState) {
   `;
 }
 
-function renderContentPlanEditor(task, streamState, actionsHtml = "") {
-  if (!task || !task.contentPlan) {
-    return `
-      <div class="content-plan-editor content-plan-big-editor empty-inline">
-        <div class="editor-head">
-          <div class="editor-title-block">
-            <strong>等待内容规划</strong>
-            <p class="muted">先生成内容规划，再在这里调整中文提示词、节奏和分镜要求。</p>
-            ${actionsHtml}
-          </div>
-        </div>
-        ${renderContentPlanGenerationLog(streamState)}
-      </div>
-    `;
-  }
-  return `
-    <div class="content-plan-editor content-plan-big-editor" data-content-plan-task-id="${h(task.id)}">
-      <div class="editor-head">
-        <div class="editor-title-block">
-          <strong>可编辑中文内容规划</strong>
-          <span class="muted">直接改这一整段中文，下一步会严格按这里的内容生成分镜。</span>
-          ${actionsHtml}
-        </div>
-        <span class="status success">自动保存</span>
-      </div>
-      <textarea rows="24" data-content-plan-task-id="${h(task.id)}" data-content-plan-text placeholder="AI 生成后会在这里形成一段完整中文内容规划。">${h(contentPlanText(task))}</textarea>
-      ${renderContentPlanGenerationLog(streamState)}
-    </div>
-  `;
-}
-
 function renderStoryboardGenerationLog(streamState) {
   const stateForDisplay = streamState || {};
   const label = stateForDisplay.label || "等待生成";
@@ -1549,13 +1640,13 @@ function renderStoryboardScriptEditor(task, streamState, actionsHtml = "") {
   const scriptText = isStreaming
     ? String(stateForDisplay.text || "")
     : String(stateForDisplay.rawText || "") || storyboardScriptDraftText(task);
-  if (!task || !task.contentPlan) {
+  if (!task) {
     return `
       <div class="content-plan-editor content-plan-big-editor storyboard-script-editor empty-inline">
         <div class="editor-head">
           <div class="editor-title-block">
             <strong>等待分镜脚本</strong>
-            <p class="muted">先生成内容规划，再按分镜设置输出可编辑分镜脚本。</p>
+            <p class="muted">输入视频想法和产品图后，点击生成分镜脚本。</p>
             ${actionsHtml}
           </div>
         </div>
@@ -1574,7 +1665,7 @@ function renderStoryboardScriptEditor(task, streamState, actionsHtml = "") {
         </div>
         <span class="status ${sceneCount ? "success" : "info"}">${sceneCount ? `${sceneCount} 镜` : "等待生成"}</span>
       </div>
-      <textarea rows="24" data-storyboard-script-task-id="${h(task.id)}" data-storyboard-script-text placeholder="点击“用当前规划生成分镜”后，模型流式返回的分镜脚本会出现在这里。">${h(scriptText)}</textarea>
+      <textarea rows="24" data-storyboard-script-task-id="${h(task.id)}" data-storyboard-script-text placeholder="点击“生成分镜脚本”后，模型流式返回的分镜脚本会出现在这里。">${h(scriptText)}</textarea>
       ${renderStoryboardGenerationLog(streamState)}
     </div>
   `;
@@ -1593,6 +1684,7 @@ function renderStoryboardPresetSelect(contentBrief) {
     <label class="storyboard-inline-settings">
       <span>分镜设置</span>
       <select data-storyboard-preset>
+        ${option("6:detailed", "6 镜 · 细致")}
         ${option("auto:detailed", "自动 · 细致")}
         ${option("6:standard", "6 镜 · 标准")}
         ${option("8:detailed", "8 镜 · 细致")}
@@ -1648,6 +1740,10 @@ function renderProductImageRoleOptions(value) {
   return Core.productImageRoles.map((role) => `<option value="${h(role)}" ${role === value ? "selected" : ""}>${h(role)}</option>`).join("");
 }
 
+function productImageFallbackRole(index) {
+  return Core.productImageRoles[Math.min(index, Core.productImageRoles.length - 1)] || "细节";
+}
+
 function renderProductReferenceGroup(product, options = {}) {
   const productId = product && product.id || "";
   const images = Array.isArray(product && product.images) ? product.images : [];
@@ -1655,6 +1751,12 @@ function renderProductReferenceGroup(product, options = {}) {
   const videoMaterials = Core.videoProductMaterials(product || {});
   const hasMaterials = Boolean(materials.length);
   const title = options.title || "产品参考图组";
+  const guidance = Core.productImageRoles.map((role) => `
+    <span class="reference-role-chip">
+      <strong>${h(role)}</strong>
+      <em>${h(Core.productImageRolePurposes[role] || "")}</em>
+    </span>
+  `).join("");
   const rows = images.map((image) => {
     const preview = image.dataUrl || image.url
       ? `<img src="${h(image.dataUrl || image.url)}" alt="${h(image.label || image.role || "产品参考图")}" />`
@@ -1676,6 +1778,7 @@ function renderProductReferenceGroup(product, options = {}) {
               <span>参与视频</span>
             </label>
           </div>
+          <p class="reference-purpose">${h(Core.productImageRolePurposes[image.role] || "用于补充产品视觉参考。")}</p>
         </div>
         <button class="button icon-button" data-action="remove-product-reference-image" data-product-id="${h(productId)}" data-product-image-id="${h(image.id)}" title="移除参考图">×</button>
       </div>
@@ -1702,9 +1805,11 @@ function renderProductReferenceGroup(product, options = {}) {
       <div class="reference-group-head">
         <div>
           <strong>${h(title)}</strong><span class="muted"> ${hasMaterials ? `${materials.length} 张 · ${videoMaterials.length || 0} 参与视频` : "一张也可开始"}</span>
+          <p class="reference-guidance-copy">推荐 5-7 张产品图：主图、正面、侧面、背面、45 度、细节、场景图；主图锁定整体外观，场景图只参考环境。</p>
         </div>
         <span class="status ${hasMaterials ? "success" : "danger"}">${hasMaterials ? "图片已就绪" : "缺少图片"}</span>
       </div>
+      <div class="reference-role-guide">${guidance}</div>
       <div class="reference-actions">
         <label class="button">
           上传参考图
@@ -1714,7 +1819,7 @@ function renderProductReferenceGroup(product, options = {}) {
         <button class="button" data-action="clear-product-image" data-product-id="${h(productId)}">清空上传图</button>
       </div>
       <div class="reference-image-list">
-        ${rows || legacyRows || `<div class="reference-empty">上传主图即可进入流程；多图用于补全正面、侧面和细节。</div>`}
+        ${rows || legacyRows || `<div class="reference-empty">上传主图即可进入流程；推荐补齐正面、侧面、背面、45 度、细节和场景图。</div>`}
       </div>
     </div>
   `;
@@ -1726,21 +1831,12 @@ function renderCreate() {
   const productMaterials = Core.productMaterials(product);
   const hasProductMaterials = Boolean(productMaterials.length);
   const latestPlan = latestContentPlanTask();
-  const streamState = displayContentPlanStreamState(state.contentPlanStream);
   const storyboardStream = state.storyboardStream || {};
-  const hasPreviousPlan = Boolean(latestPlan && String(latestPlan.previousContentPlanText || "").trim());
   const hasStoryboard = Boolean(latestPlan && (Array.isArray(latestPlan.storyboard) && latestPlan.storyboard.length || String(storyboardScriptDraftText(latestPlan)).trim()));
-  const contentPlanActions = `
-    <div class="editor-actions content-plan-editor-actions">
-      <button class="button" data-action="generate-content-plan" ${pendingAttr("generate-content-plan")}>${pendingLabel("generate-content-plan", "生成内容规划", "生成中")}</button>
-      <button class="button" data-action="regenerate-content-plan" ${pendingAttr("regenerate-content-plan", !latestPlan)}>${pendingLabel("regenerate-content-plan", "重新生成", "重新生成中")}</button>
-      <button class="button" data-action="restore-previous-content-plan" ${hasPreviousPlan ? "" : "disabled"}>恢复上一版</button>
-    </div>
-  `;
   const storyboardActions = `
     <div class="editor-actions storyboard-editor-actions">
       ${renderStoryboardPresetSelect(contentBrief)}
-      <button class="button" data-action="generate-storyboard-from-plan" ${latestPlan && latestPlan.contentPlan ? pendingAttr("generate-storyboard-from-plan") : "disabled"}>${pendingLabel("generate-storyboard-from-plan", "用当前规划生成分镜", "生成分镜中")}</button>
+      <button class="button" data-action="generate-storyboard-script" ${pendingAttr("generate-storyboard-script")}>${pendingLabel("generate-storyboard-script", "生成分镜脚本", "生成分镜中")}</button>
       ${renderVideoBatchControls(contentBrief)}
       <button class="button primary" data-action="enter-review-video" ${hasStoryboard ? "" : "disabled"}>进入审核生成视频</button>
     </div>
@@ -1748,7 +1844,7 @@ function renderCreate() {
   return `
     <section class="create-screen">
       <div class="section-head">
-        <div><h1>新建内容规划</h1><p class="muted">输入一个大概想法和产品图，调用真实大模型返回完整视频内容规划。</p></div>
+        <div><h1>新建分镜脚本</h1><p class="muted">输入一个视频想法和产品图，直接生成可编辑分镜脚本。</p></div>
         <div class="actions">
           <button class="button" data-view="settings">接口设置</button>
         </div>
@@ -1760,7 +1856,7 @@ function renderCreate() {
             <div class="panel-head"><h2>输入</h2><span class="status ${state.integrations.llm.apiKey ? "success" : "warning"}">${state.integrations.llm.apiKey ? "LLM 已配置" : "需要配置 LLM"}</span></div>
             <div class="panel-body stack">
               <div class="field">
-                <label>产品想法</label>
+                <label>视频想法</label>
                 <textarea data-field="contentBrief.seed" rows="4" placeholder="例如：我想在 TikTok 美国地区售卖一款挂脖风扇，主打夏天通勤、户外排队和露营降温。">${h(contentBrief.seed || "")}</textarea>
               </div>
             </div>
@@ -1777,9 +1873,8 @@ function renderCreate() {
           </div>
 
           <div class="panel">
-            <div class="panel-head"><h2>规划结果</h2><span class="tag">真实返回</span></div>
+            <div class="panel-head"><h2>分镜脚本</h2><span class="tag">真实返回</span></div>
             <div class="panel-body stack">
-              ${renderContentPlanEditor(latestPlan, streamState, contentPlanActions)}
               ${renderStoryboardScriptEditor(latestPlan, storyboardStream, storyboardActions)}
             </div>
           </div>
@@ -2469,6 +2564,47 @@ function renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed) {
   `;
 }
 
+function videoQualityReviewStatusLabel(status) {
+  return {
+    pass: ["success", "通过"],
+    warning: ["warning", "需人工确认"],
+    fail: ["danger", "不通过"],
+  }[status] || ["muted", "未审查"];
+}
+
+function renderVideoQualityReviewPanel(task) {
+  const review = task.videoQualityReview || null;
+  const [statusClassName, statusLabel] = videoQualityReviewStatusLabel(review && review.status);
+  const issues = review && Array.isArray(review.issues) ? review.issues : [];
+  const canReview = Boolean(task.video && task.video.url && task.status === "video_review");
+  return `
+    <div class="panel video-quality-review-panel">
+      <div class="panel-head">
+        <div>
+          <h2>AI 审查结果</h2>
+          <p class="muted">GPT-5.5 对比产品图和视频关键帧，给出一致性判断和下次生成建议。</p>
+        </div>
+        <button class="button compact ${review ? "" : "primary"}" data-action="review-video-quality" ${canReview ? "" : "disabled"}>${review ? "重新审查" : "执行 AI 审查"}</button>
+      </div>
+      <div class="panel-body">
+        ${review ? `
+          <div class="review-fact-grid">
+            <div><span>审查状态</span><strong><span class="status ${statusClassName}">${h(statusLabel)}</span></strong></div>
+            <div><span>一致性分数</span><strong>${h(String(review.score ?? "-"))}</strong></div>
+            <div><span>建议重试</span><strong>${review.shouldRetry ? "是" : "否"}</strong></div>
+            <div><span>审查时间</span><strong>${h(formatTaskDate(review.reviewedAt))}</strong></div>
+          </div>
+          ${issues.length ? `<div class="mini-list"><strong>主要问题</strong><ul>${issues.map((issue) => `<li>${h(issue)}</li>`).join("")}</ul></div>` : `<p class="muted">没有记录明显问题。</p>`}
+          ${review.suggestion ? `<p><strong>审查建议：</strong>${h(review.suggestion)}</p>` : ""}
+          ${review.retryPrompt ? `<p><strong>重试提示词：</strong>${h(review.retryPrompt)}</p>` : ""}
+        ` : `
+          <p class="muted">视频生成完成后，可以执行一次轻量 AI 审查；系统会抽取关键帧并把结果写回这里。</p>
+        `}
+      </div>
+    </div>
+  `;
+}
+
 function renderReviewDetail(task) {
   const canApprove = task.video && task.status === "video_review";
   const isGenerating = task.status === "video_generating";
@@ -2542,6 +2678,7 @@ function renderReviewDetail(task) {
               ${renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed)}
             </div>
           </div>
+          ${renderVideoQualityReviewPanel(task)}
         </aside>
       </div>
       ${storyboardEditorOpen ? renderStoryboardEditor(task) : ""}
@@ -3572,11 +3709,13 @@ function bindEvents() {
         const product = Core.getById(state.products, productId);
         if (!product) return;
         Core.addProductImage(product, {
-          type: upload.url ? "url" : "upload",
+          type: upload.publicUrl ? "hosted" : (upload.url ? "url" : "upload"),
           url: upload.url || "",
+          publicUrl: upload.publicUrl || "",
+          modelVisible: Boolean(upload.modelVisible),
           dataUrl: upload.dataUrl || "",
           label: safeImageLabel(file.name, "本地上传图片"),
-          role: product.images && product.images.length ? "细节" : "主图",
+          role: productImageFallbackRole(product.images && product.images.length || 0),
           useForVideo: true,
         });
         if (upload.url) {
@@ -3624,7 +3763,7 @@ async function handleAction(dataset) {
     copyDetailPlatformId = "";
     saveState();
     renderShell();
-    toast("已把收藏带入新建内容规划。");
+    toast("已把收藏带入新建分镜脚本。");
     return;
   }
   if (action === "use-favorite-for-reverse") {
@@ -4013,8 +4152,8 @@ async function handleAction(dataset) {
     toast("已恢复上一版内容规划。");
     return;
   }
-  if (action === "generate-storyboard-from-plan") {
-    await generateStoryboardFromPlanWithUi(action);
+  if (action === "generate-storyboard-script") {
+    await generateStoryboardScriptWithUi(action);
     return;
   }
   if (action === "enter-review-video") {
@@ -4134,8 +4273,9 @@ async function handleAction(dataset) {
   if (action === "generate-video") {
     if (!startPending(action)) return;
     const result = await generateVideoForTask(task);
-  const message = result.ok
+    const message = result.ok
       ? task.status === "video_generating" ? "视频任务已提交，等待生成完成后查询结果。" : "视频已生成，进入审核。"
+      : result.recovered ? "视频提交没有留下可查询任务 ID，已恢复到待生成视频；分镜已保留，可重新提交。"
       : `视频 provider 调用失败：${result.error.message}`;
     finishPending(action);
     toast(message);
@@ -4149,6 +4289,33 @@ async function handleAction(dataset) {
       : `查询视频结果失败：${result.error.message}`;
     finishPending(action);
     toast(message);
+    return;
+  }
+  if (action === "review-video-quality") {
+    if (!startPending(action)) return;
+    try {
+      const review = await reviewVideoQualityForTask(task);
+      finishPending(action);
+      saveState();
+      renderShell();
+      toast(`AI 审查完成：${videoQualityReviewStatusLabel(review.status)[1]}，分数 ${review.score}。`);
+    } catch (error) {
+      task.videoQualityReview = Object.assign({}, task.videoQualityReview || {}, {
+        status: "warning",
+        score: 0,
+        issues: [`审查调用失败：${error.message}`],
+        suggestion: "检查 GPT-5.5 是否支持图片输入、API Key 是否可用，并确认视频已下载到本地后重试。",
+        retryPrompt: "",
+        shouldRetry: false,
+        reviewedAt: new Date().toISOString(),
+      });
+      task.providerResponses = task.providerResponses || {};
+      task.providerResponses.videoQualityReview = { ok: false, error: error.message };
+      finishPending(action);
+      saveState();
+      renderShell();
+      toast(`AI 审查失败：${error.message}`);
+    }
     return;
   }
   if (action === "refresh-review-status") {
@@ -4790,14 +4957,18 @@ async function generateContentPlanWithUi(action, options = {}) {
     updateContentPlanStream({
       status: "done",
       label: "内容规划已生成",
-      text: `已收到模型返回${streamedLength ? `（流式片段约 ${streamedLength} 字符）` : ""}，内容规划已写入下方可编辑中文规划框。`,
+      text: `已收到模型返回${streamedLength ? `（流式片段约 ${streamedLength} 字符）` : ""}，已开始用于生成分镜脚本。`,
       rawText: task.contentPlanText,
     });
-    toast(options.keepPrevious ? "内容规划已重新生成，可恢复上一版。" : "内容规划已生成，可以继续生成分镜。");
+    if (!options.silentSuccessToast) {
+      toast(options.keepPrevious ? "内容规划已重新生成，可恢复上一版。" : "内容规划已生成，可以继续生成分镜。");
+    }
+    return task;
   } catch (error) {
     finishPending(action, { render: false });
     updateContentPlanStream({ status: "error", label: "生成失败", text: `${state.contentPlanStream?.text || ""}\n\n错误：${error.message}`.trim() });
     toast(`内容规划生成失败：${error.message}`);
+    return null;
   }
 }
 
@@ -4859,9 +5030,69 @@ async function generateStoryboardFromPlanWithUi(action) {
   }
 }
 
+async function generateStoryboardFromIdeaWithUi(action) {
+  syncDraftForm();
+  if (!startPending(action)) return;
+  let task = null;
+  try {
+    updateStoryboardStream({ status: "streaming", label: "正在请求大模型", text: "正在按视频想法和产品图生成分镜...\n" });
+    const request = Core.buildStoryboardFromIdeaProviderRequest(state);
+    const response = await callProviderStream("storyboard", request, (event) => {
+      if (event.type === "start") {
+        updateStoryboardStream({ status: "streaming", label: "正在连接上游模型" });
+      } else if (event.type === "chunk") {
+        const current = state.storyboardStream || {};
+        updateStoryboardStream({
+          status: "streaming",
+          label: "模型正在返回分镜",
+          text: `${current.text || ""}${event.text || ""}`,
+        });
+      } else if (event.type === "done") {
+        updateStoryboardStream({ status: "streaming", label: "正在整理结构化分镜" });
+      }
+    });
+    task = Core.createStoryboardTaskFromIdea(state, {
+      providerRequest: request,
+      providerResponse: response,
+    });
+    Core.applyStoryboardProviderResult([task], response);
+    if (!Array.isArray(task.storyboard) || !task.storyboard.length) {
+      throw new Error("大模型没有返回可用的分镜 scenes，请检查响应 JSON。");
+    }
+    task.storyboardScriptText = storyboardScriptText(task);
+    task.status = "storyboard_ready";
+    state.selectedTaskId = task.id;
+    const streamedLength = String(state.storyboardStream?.text || "").length;
+    finishPending(action, { render: false });
+    updateStoryboardStream({
+      status: "done",
+      label: "分镜脚本已生成",
+      text: `已收到模型返回${streamedLength ? `（流式片段约 ${streamedLength} 字符）` : ""}，分镜脚本已写入上方可编辑中文分镜框。`,
+      rawText: task.storyboardScriptText,
+    });
+    saveState();
+    if (view === "create") renderShell();
+    toast(`已生成 ${task.storyboard.length} 镜分镜，可在当前页检查后再进入审核生成视频。`);
+  } catch (error) {
+    finishPending(action, { render: false });
+    if (task && task.id) {
+      state.tasks = state.tasks.filter((item) => item.id !== task.id);
+      if (state.selectedTaskId === task.id) state.selectedTaskId = state.tasks[0] && state.tasks[0].id || null;
+    }
+    updateStoryboardStream({ status: "error", label: "生成失败", text: `${state.storyboardStream?.text || ""}\n\n错误：${error.message}`.trim() });
+    saveState();
+    if (view === "create") renderShell();
+    toast(`分镜生成失败：${error.message}`);
+  }
+}
+
+async function generateStoryboardScriptWithUi(action) {
+  await generateStoryboardFromIdeaWithUi(action);
+}
+
 async function generateVideoForTask(task) {
   if (!Array.isArray(task.storyboard) || !task.storyboard.length) {
-    const error = new Error("请先用当前内容规划生成分镜，再生成视频。");
+    const error = new Error("请先生成分镜脚本，再生成视频。");
     task.reviewNote = error.message;
     return { ok: false, task, error };
   }
@@ -4869,15 +5100,30 @@ async function generateVideoForTask(task) {
     task.video = null;
     task.reviewNote = "";
   }
-  Core.simulateVideoGeneration(state, task);
   try {
+    const product = Core.getById(state.products, task.productId || state.selectedProductId);
+    await ensureProductImagesHostedForVideo(product);
+    Core.simulateVideoGeneration(state, task);
     task.providerResponses = task.providerResponses || {};
     task.providerResponses.video = await callProvider("video", task.providerRequests.video);
     Core.applyVideoProviderResult(task, task.providerResponses.video);
+    if (!(task.video && (task.video.url || task.video.jobId))) {
+      const error = new Error(task.reviewNote || "视频任务没有返回可查询的任务 ID，请重新生成视频。");
+      return { ok: false, task, error, recovered: true };
+    }
     return { ok: true, task };
   } catch (error) {
     task.providerResponses = task.providerResponses || {};
     task.providerResponses.video = { ok: false, error: error.message };
+    if (isModelVisibleImageError(error)) {
+      task.reviewNote = modelVisibleImagePreflightMessage(error);
+      task.status = "storyboard_ready";
+      task.updatedAt = new Date().toISOString();
+      return { ok: false, task, error, recovered: true };
+    }
+    task.reviewNote = error.message;
+    task.status = "rejected";
+    task.updatedAt = new Date().toISOString();
     return { ok: false, task, error };
   }
 }
@@ -4895,6 +5141,30 @@ async function refreshVideoForTask(task) {
     task.providerResponses.videoStatus = { ok: false, error: error.message };
     return { ok: false, task, error };
   }
+}
+
+async function reviewVideoQualityForTask(task) {
+  if (!task.video || !task.video.url) {
+    throw new Error("视频生成完成后才能执行 AI 审查。");
+  }
+  if (!shouldInlineReverseFrames()) {
+    throw new Error(reverseVisionRequirementMessage());
+  }
+  const product = Core.getById(state.products, task.productId || state.selectedProductId);
+  const extractedFrames = await extractGeneratedVideoFrames(task);
+  const visionFrames = await loadReverseFrameData(extractedFrames);
+  const request = Core.buildVideoQualityReviewProviderRequest(state, task, product, { frames: visionFrames });
+  task.providerRequests = task.providerRequests || {};
+  task.providerResponses = task.providerResponses || {};
+  task.providerRequests.videoQualityReview = Core.buildVideoQualityReviewProviderRequest(state, task, product, { frames: extractedFrames });
+  task.providerResponses.videoQualityReview = await callProvider("video-quality-review", request);
+  const applied = Core.applyVideoQualityReviewProviderResult(task, task.providerResponses.videoQualityReview);
+  if (!applied) {
+    throw new Error("GPT-5.5 没有返回可用的审查 JSON。");
+  }
+  task.videoQualityReview.frames = extractedFrames.map((frame) => Object.assign({}, frame, { dataUrl: undefined }));
+  task.videoQualityReview.frameCount = extractedFrames.length;
+  return task.videoQualityReview;
 }
 
 function exportState() {

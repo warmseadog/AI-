@@ -63,9 +63,16 @@ async function main() {
   const outputFixtureDir = path.join(__dirname, "..", "outputs");
   const outputFixturePath = path.join(outputFixtureDir, "verify-static-video.mp4");
   const providerEventsPath = path.join(outputFixtureDir, "provider-events.jsonl");
+  const ffprobeFixturePath = path.join(outputFixtureDir, "verify-ffprobe.js");
   fs.mkdirSync(outputFixtureDir, { recursive: true });
   fs.writeFileSync(outputFixturePath, Buffer.from("verify-video"));
+  fs.writeFileSync(ffprobeFixturePath, "#!/usr/bin/env node\nprocess.stdout.write(process.env.VERIFY_FFPROBE_DURATION || '5.061950');\n");
+  fs.chmodSync(ffprobeFixturePath, 0o755);
   fs.rmSync(providerEventsPath, { force: true });
+  const originalFfprobePath = process.env.AI_VIDEO_FFPROBE_PATH;
+  const originalVerifyFfprobeDuration = process.env.VERIFY_FFPROBE_DURATION;
+  process.env.AI_VIDEO_FFPROBE_PATH = ffprobeFixturePath;
+  process.env.IMAGE_HOST_PROVIDER = "";
 
   const server = createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -76,6 +83,36 @@ async function main() {
   const upstream = http.createServer((req, res) => {
     const call = { method: req.method, url: req.url, body: "" };
     upstreamCalls.push(call);
+    if (req.url.startsWith("/imgbb/upload") && req.method === "POST") {
+      req.on("data", (chunk) => {
+        call.body += chunk.toString("latin1");
+      });
+      req.on("end", () => {
+        const requestUrl = new URL(req.url, upstreamBaseUrl || "http://127.0.0.1");
+        call.contentType = req.headers["content-type"] || "";
+        call.apiKey = requestUrl.searchParams.get("key") || "";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          success: true,
+          status: 200,
+          data: {
+            url: "https://i.ibb.co/verify/hosted.png",
+            display_url: "https://i.ibb.co/verify/hosted-display.png",
+            image: { url: "https://i.ibb.co/verify/hosted.png" },
+          },
+        }));
+      });
+      return;
+    }
+    if (req.url === "/video/official-short-status" && req.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "cgt-short",
+        status: "succeeded",
+        content: { video_url: "https://example.test/short-five-second.mp4" },
+      }));
+      return;
+    }
     if (req.url === "/chat/flaky-completions" && req.method === "POST") {
       req.on("data", (chunk) => {
         call.body += chunk;
@@ -411,6 +448,46 @@ async function main() {
     assert.strictEqual(uploadedImage.upload.mimeType, "image/png", "image upload returns image mime type");
     const uploadedImageFile = path.join(__dirname, "..", uploadedImage.upload.url);
     assert.ok(fs.existsSync(uploadedImageFile), "image upload stores file under outputs uploads");
+    const originalImageHostProvider = process.env.IMAGE_HOST_PROVIDER;
+    const originalImgbbApiKey = process.env.IMGBB_API_KEY;
+    const originalImgbbUploadEndpoint = process.env.IMGBB_UPLOAD_ENDPOINT;
+    process.env.IMAGE_HOST_PROVIDER = "imgbb";
+    process.env.IMGBB_API_KEY = "verify-imgbb-key";
+    process.env.IMGBB_UPLOAD_ENDPOINT = `${upstreamBaseUrl}/imgbb/upload`;
+    const imgbbImage = await requestRaw(baseUrl, "/api/uploads/image?filename=imgbb.png", Buffer.from("imgbb-image"), "image/png");
+    assert.strictEqual(imgbbImage.upload.publicUrl, "https://i.ibb.co/verify/hosted.png", "ImgBB upload returns the hosted direct image URL");
+    assert.strictEqual(imgbbImage.upload.modelVisible, true, "ImgBB hosted upload is marked model visible");
+    assert.strictEqual(imgbbImage.upload.imageHostProvider, "imgbb", "ImgBB hosted upload records the image host provider");
+    const imgbbCall = upstreamCalls.find((call) => call.url.startsWith("/imgbb/upload"));
+    assert.ok(imgbbCall, "image upload calls the configured ImgBB endpoint");
+    assert.strictEqual(imgbbCall.apiKey, "verify-imgbb-key", "image upload sends the ImgBB API key as a query parameter");
+    assert.match(imgbbCall.contentType, /multipart\/form-data/i, "image upload sends ImgBB multipart form data");
+    if (originalImageHostProvider === undefined) {
+      delete process.env.IMAGE_HOST_PROVIDER;
+    } else {
+      process.env.IMAGE_HOST_PROVIDER = originalImageHostProvider;
+    }
+    if (originalImgbbApiKey === undefined) {
+      delete process.env.IMGBB_API_KEY;
+    } else {
+      process.env.IMGBB_API_KEY = originalImgbbApiKey;
+    }
+    if (originalImgbbUploadEndpoint === undefined) {
+      delete process.env.IMGBB_UPLOAD_ENDPOINT;
+    } else {
+      process.env.IMGBB_UPLOAD_ENDPOINT = originalImgbbUploadEndpoint;
+    }
+    const originalPublicUploadBaseUrl = process.env.AI_VIDEO_PUBLIC_UPLOAD_BASE_URL;
+    process.env.AI_VIDEO_PUBLIC_UPLOAD_BASE_URL = "https://cdn.example.test/workbench-assets/";
+    const hostedImage = await requestRaw(baseUrl, "/api/uploads/image?filename=hosted.png", Buffer.from("hosted-image"), "image/png");
+    assert.ok(hostedImage.upload.publicUrl.startsWith("https://cdn.example.test/workbench-assets/uploads/"), "image upload returns a model-visible public URL when configured");
+    assert.ok(hostedImage.upload.publicUrl.endsWith("/hosted.png"), "image upload public URL preserves the stored filename");
+    assert.strictEqual(hostedImage.upload.modelVisible, true, "image upload marks public URLs as model visible");
+    if (originalPublicUploadBaseUrl === undefined) {
+      delete process.env.AI_VIDEO_PUBLIC_UPLOAD_BASE_URL;
+    } else {
+      process.env.AI_VIDEO_PUBLIC_UPLOAD_BASE_URL = originalPublicUploadBaseUrl;
+    }
 
     const uploaded = await requestRaw(baseUrl, "/api/uploads/video?filename=reference.mp4", Buffer.from("verify-video"), "video/mp4");
     assert.strictEqual(uploaded.upload.fileName, "reference.mp4", "video upload returns file name");
@@ -517,6 +594,178 @@ async function main() {
     const videoStatus = await request(baseUrl, "/api/provider/video", { providerRequest: statusRequest });
     assert.strictEqual(upstreamCalls.at(-1).method, "GET", "video status proxy uses GET");
     assert.strictEqual(videoStatus.upstream.data.output.video_url, "https://example.test/video.mp4", "video status proxy returns upstream result");
+
+    const officialJimengVideo = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/official-jimeng`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [
+            { type: "text", text: "stable product video" },
+            { role: "reference_image", type: "image_url", image_url: { url: "https://example.test/front.png" } },
+            { role: "reference_image", type: "image_url", image_url: { url: "https://example.test/side.png" } },
+          ],
+          duration: 15,
+          ratio: "9:16",
+          resolution: "720p",
+          watermark: false,
+          camera_fixed: false,
+        },
+      },
+    });
+    assert.strictEqual(officialJimengVideo.mode, "http", "official Jimeng video proxy uses HTTP mode");
+    const officialJimengLog = fs.readFileSync(providerEventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line)).reverse().find((entry) => entry.kind === "video" && entry.endpoint.endsWith("/video/official-jimeng") && entry.phase === "request");
+    assert.strictEqual(officialJimengLog.requestSummary.imageUrlCount, 2, "official Jimeng request log records image URL content parts");
+    assert.strictEqual(officialJimengLog.requestSummary.referenceImageCount, 2, "official Jimeng request log records explicit reference image count");
+    assert.strictEqual(officialJimengLog.requestSummary.duration, 15, "official Jimeng request log records submitted duration");
+    assert.strictEqual(officialJimengLog.requestSummary.topLevelDuration, 15, "official Jimeng request log records top-level duration");
+    assert.strictEqual(officialJimengLog.requestSummary.ratio, "9:16", "official Jimeng request log records submitted ratio");
+    assert.strictEqual(officialJimengLog.requestSummary.resolution, "720p", "official Jimeng request log records submitted resolution");
+
+    const localOfficialImageDir = path.join(outputFixtureDir, "uploads", "verify-jimeng-inline");
+    fs.mkdirSync(localOfficialImageDir, { recursive: true });
+    fs.writeFileSync(path.join(localOfficialImageDir, "product.png"), Buffer.from("verify-product-image"));
+    await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/official-local-inline`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [
+            { type: "text", text: "stable product video" },
+            {
+              role: "reference_image",
+              type: "image_url",
+              image_url: {
+                url: "https://i.ibb.co/unreachable/product.png",
+                local_url: "/outputs/uploads/verify-jimeng-inline/product.png",
+              },
+            },
+          ],
+          duration: 15,
+          ratio: "9:16",
+          resolution: "720p",
+        },
+      },
+    });
+    const localInlineCall = upstreamCalls.find((call) => call.url === "/video/official-local-inline");
+    assert.ok(localInlineCall, "official Jimeng local-inline request reaches upstream");
+    const localInlineBody = JSON.parse(localInlineCall.body);
+    assert.match(localInlineBody.content[1].image_url.url, /^data:image\/png;base64,/, "official Jimeng local upload is converted to a base64 image before upstream");
+    assert.ok(!("local_url" in localInlineBody.content[1].image_url), "official Jimeng upstream request strips internal local_url metadata");
+
+    const guardedVideoCallCount = upstreamCalls.length;
+    const missingReferenceImage = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/missing-reference-image`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        requiresReferenceImage: true,
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [{ type: "text", text: "stable product video without image" }],
+          parameters: { reference_image_count: 0 },
+        },
+      },
+    }, { expectOk: false });
+    assert.strictEqual(missingReferenceImage.response.status, 400, "video proxy rejects product video requests with no model-visible image URL");
+    assert.match(missingReferenceImage.data.error, /模型没有收到产品图链接/, "missing image URL failure gives an operator-readable error");
+    assert.strictEqual(upstreamCalls.length, guardedVideoCallCount, "missing image URL validation does not call the upstream video provider");
+
+    const staleOfficialCallCount = upstreamCalls.length;
+    const staleOfficialMissingReferenceImage = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/stale-official-no-image`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [{ type: "text", text: "stale official request without image" }],
+          parameters: { duration: 15, reference_image_count: 0 },
+        },
+      },
+    }, { expectOk: false });
+    assert.strictEqual(staleOfficialMissingReferenceImage.response.status, 400, "official Jimeng requests require model-visible images even when stale clients omit requiresReferenceImage");
+    assert.match(staleOfficialMissingReferenceImage.data.error, /模型没有收到产品图链接/, "stale official missing image failure is operator-readable");
+    assert.strictEqual(upstreamCalls.length, staleOfficialCallCount, "stale official missing image validation does not call upstream");
+
+    const missingOfficialImageRoleCallCount = upstreamCalls.length;
+    const missingOfficialImageRole = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/official-missing-image-role`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [
+            { type: "text", text: "official request with stale image content shape" },
+            { type: "image_url", image_url: { url: "https://example.test/product.png" } },
+          ],
+          parameters: { duration: 15, reference_image_count: 1 },
+        },
+      },
+    }, { expectOk: false });
+    assert.strictEqual(missingOfficialImageRole.response.status, 400, "official Jimeng image content without role is rejected locally");
+    assert.match(missingOfficialImageRole.data.error, /image content 必须带 role 字段/, "missing official image role failure is operator-readable");
+    assert.strictEqual(upstreamCalls.length, missingOfficialImageRoleCallCount, "missing official image role validation does not call upstream");
+
+    const invalidOfficialImageRoleCallCount = upstreamCalls.length;
+    const invalidOfficialImageRole = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        endpoint: `${upstreamBaseUrl}/video/official-invalid-image-role`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        body: {
+          model: "doubao-seedance-2-0-260128",
+          content: [
+            { type: "text", text: "official request with invalid image role" },
+            { role: "user", type: "image_url", image_url: { url: "https://example.test/product.png" } },
+          ],
+          duration: 15,
+          ratio: "9:16",
+          resolution: "720p",
+        },
+      },
+    }, { expectOk: false });
+    assert.strictEqual(invalidOfficialImageRole.response.status, 400, "official Jimeng invalid image role is rejected locally");
+    assert.match(invalidOfficialImageRole.data.error, /role 必须是 reference_image/, "invalid official image role failure is operator-readable");
+    assert.strictEqual(upstreamCalls.length, invalidOfficialImageRoleCallCount, "invalid official image role validation does not call upstream");
+
+    const shortOfficialStatus = await request(baseUrl, "/api/provider/video", {
+      providerRequest: {
+        provider: "jimeng-seedance-official",
+        mode: "http",
+        apiStyle: "jimeng-seedance-official",
+        method: "GET",
+        endpoint: `${upstreamBaseUrl}/video/official-short-status`,
+        model: "doubao-seedance-2-0-260128",
+        apiKey: "test-key",
+        expectedDuration: 15,
+      },
+    }, { expectOk: false });
+    assert.strictEqual(shortOfficialStatus.response.status, 502, "official Jimeng 5 second output is rejected when 15 seconds is expected");
+    assert.match(shortOfficialStatus.data.error, /视频时长不符合要求/, "short official output gives an operator-readable duration failure");
 
     const downloaded = await request(baseUrl, "/api/video/download", {
       taskId: "task-download-verify",
@@ -670,6 +919,17 @@ async function main() {
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => upstream.close(resolve));
     fs.rmSync(outputFixturePath, { force: true });
+    fs.rmSync(ffprobeFixturePath, { force: true });
+    if (originalFfprobePath === undefined) {
+      delete process.env.AI_VIDEO_FFPROBE_PATH;
+    } else {
+      process.env.AI_VIDEO_FFPROBE_PATH = originalFfprobePath;
+    }
+    if (originalVerifyFfprobeDuration === undefined) {
+      delete process.env.VERIFY_FFPROBE_DURATION;
+    } else {
+      process.env.VERIFY_FFPROBE_DURATION = originalVerifyFfprobeDuration;
+    }
   }
 }
 

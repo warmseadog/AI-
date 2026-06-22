@@ -15,10 +15,11 @@ assert.strictEqual(localConfig.integrations.llm.model, "gpt-5.5", "local startup
 assert.strictEqual(localConfig.integrations.llm.endpoint, "https://toapis.com/v1/chat/completions", "local startup config uses GPT-5.5 endpoint");
 assert.deepStrictEqual(JSON.parse(JSON.stringify(localConfig.selectedPlatforms)), ["tiktok"], "local startup config selects TikTok only");
 assert.ok(indexHtml.includes("app.js?v="), "index references app.js with a cache-busting version");
-assert.ok(indexHtml.includes("styles.css?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix styles");
-assert.ok(indexHtml.includes("core.js?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix core changes");
-assert.ok(indexHtml.includes("app.js?v=20260614-product-reference-upload-fix"), "index cache-busts product reference upload fix app changes");
+assert.ok(indexHtml.includes("styles.css?v=20260617-concise-content-plan"), "index cache-busts concise content-plan styles");
+assert.ok(indexHtml.includes("core.js?v=20260618-jimeng-inline-image"), "index cache-busts official Jimeng inline image fallback core changes");
+assert.ok(indexHtml.includes("app.js?v=20260618-jimeng-inline-image"), "index cache-busts official Jimeng inline image fallback app changes");
 assert.ok(indexHtml.includes("local-config.js"), "index can load local ignored provider config before app startup");
+assert.ok(indexHtml.includes("local-config.js?v=20260617-video-config"), "index cache-busts local video provider config");
 assert.ok(appJs.includes("loadReverseFrameData"), "app can inline extracted reverse frames for vision-capable LLMs");
 assert.ok(appJs.includes("openai-vision-chat"), "app documents the vision-capable LLM apiStyle for reverse reconstruction");
 assert.ok(appJs.includes("uploadProductImageFile"), "app uploads product images through the local server instead of storing large data URLs");
@@ -268,6 +269,27 @@ const recoveredScript = vm.runInContext(`
 assert.strictEqual(recoveredScript.count, 10, "stream fallback storyboards JSON is applied to the requested storyboard count");
 assert.ok(recoveredScript.text.includes("第 1 镜"), "stream fallback storyboards JSON generates editable storyboard script text");
 assert.ok(recoveredScript.text.includes("Hook"), "stream fallback storyboard script includes recovered scene title");
+const lightweightScriptText = vm.runInContext(`
+  storyboardScriptText({
+    storyboard: [{
+      time: "0-2s",
+      title: "水质对比",
+      visual: "两杯水并排对比。",
+      subtitle: "Before vs after",
+      voiceover: "过滤后看起来清澈很多。",
+      screenText: "过滤前 vs 过滤后",
+      camera: "45度近景",
+      motion: "轻推两杯水对齐",
+      productFocus: "净饮机在后景可见",
+      videoPrompt: "竖屏短视频，两杯水并排对比，净饮机在后景可见。",
+      reviewChecklist: ["两杯水是否并排对比清楚"],
+      riskNotes: ["不添加未经验证的检测数值"]
+    }]
+  })
+`, sandbox);
+assert.ok(lightweightScriptText.includes("视频提示词：竖屏短视频"), "storyboard script keeps the direct video prompt");
+assert.ok(!lightweightScriptText.includes("审核点："), "storyboard script hides review checklist by default");
+assert.ok(!lightweightScriptText.includes("风险提示："), "storyboard script hides risk notes by default");
 const doneStreamEditorHtml = vm.runInContext(`
   renderStoryboardScriptEditor({
     id: "task-done-stream",
@@ -299,6 +321,79 @@ assert.deepStrictEqual(JSON.parse(JSON.stringify(parsedNdjsonEvent)), {
 }, "stream parser treats one-line typed JSON objects as NDJSON events");
 assert.strictEqual(vm.runInContext("state.integrations.llm.mode", sandbox), "http", "local config keeps real http llm mode");
 assert.strictEqual(vm.runInContext("state.integrations.video.model", sandbox), "wan2.7-i2v-2026-04-25", "local config applies video model");
+assert.strictEqual(vm.runInContext("state.activeIntegrationProfileIds.video", sandbox), "local-dashscope-wan", "local config selects its active video profile");
+
+const savedLocalVideoKeyState = Core.createInitialState();
+savedLocalVideoKeyState.integrationProfiles.video.unshift({
+  id: "local-dashscope-wan",
+  name: "Wan 2.7 / DashScope",
+  provider: "tongyi-wanxiang",
+  endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+  model: "wan2.7-i2v-2026-04-25",
+  apiStyle: "dashscope-video",
+  config: {
+    mode: "http",
+    provider: "tongyi-wanxiang",
+    apiStyle: "dashscope-video",
+    endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis",
+    statusEndpoint: "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
+    model: "wan2.7-i2v-2026-04-25",
+    apiKey: "saved-video-key",
+  },
+});
+savedLocalVideoKeyState.activeIntegrationProfileIds.video = "local-dashscope-wan";
+const preservedLocalVideoKey = vm.runInContext(
+  `(() => {
+    const saved = ${JSON.stringify(JSON.stringify(savedLocalVideoKeyState))};
+    const localVideoProfile = window.AI_VIDEO_LOCAL_CONFIG.integrationProfiles.video.find((profile) => profile.id === "local-dashscope-wan");
+    const originalProfileKey = localVideoProfile.config.apiKey;
+    const originalIntegrationKey = window.AI_VIDEO_LOCAL_CONFIG.integrations.video.apiKey;
+    const previousGetItem = localStorage.getItem;
+    localVideoProfile.config.apiKey = "";
+    window.AI_VIDEO_LOCAL_CONFIG.integrations.video.apiKey = "";
+    localStorage.getItem = () => saved;
+    const loaded = loadState();
+    localStorage.getItem = previousGetItem;
+    localVideoProfile.config.apiKey = originalProfileKey;
+    window.AI_VIDEO_LOCAL_CONFIG.integrations.video.apiKey = originalIntegrationKey;
+    return loaded.integrations.video.apiKey;
+  })()`,
+  sandbox
+);
+assert.strictEqual(preservedLocalVideoKey, "saved-video-key", "local profile templates with empty keys preserve the saved API key");
+
+const staleOfficialVideoState = Core.createInitialState();
+staleOfficialVideoState.integrations.video = {
+  mode: "http",
+  provider: "jimeng-seedance-official",
+  apiStyle: "jimeng-seedance-official",
+  endpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+  statusEndpoint: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/{task_id}",
+  model: "doubao-seedance-2-0-260128",
+  apiKey: "old-official-key",
+  providerConfigs: {},
+};
+const localProfileOverride = vm.runInContext(
+  `(() => {
+    const previous = localStorage.getItem;
+    localStorage.getItem = () => ${JSON.stringify(JSON.stringify(staleOfficialVideoState))};
+    const loaded = loadState();
+    localStorage.getItem = previous;
+    return {
+      provider: loaded.integrations.video.provider,
+      apiStyle: loaded.integrations.video.apiStyle,
+      model: loaded.integrations.video.model,
+      activeProfile: loaded.activeIntegrationProfileIds.video
+    };
+  })()`,
+  sandbox
+);
+assert.deepStrictEqual(JSON.parse(JSON.stringify(localProfileOverride)), {
+  provider: "tongyi-wanxiang",
+  apiStyle: "dashscope-video",
+  model: "wan2.7-i2v-2026-04-25",
+  activeProfile: "local-dashscope-wan",
+}, "local active video profile overrides stale official Seedance state on startup");
 
 assert.ok(appHtml.includes("sidebar-shell"), "app renders the single icon sidebar shell");
 assert.ok(appHtml.includes("视频</span>"), "icon rail uses Chinese video label");
@@ -335,8 +430,31 @@ assert.ok(!appHtml.includes("打开原始视频"), "review preview does not expo
 assert.ok(appHtml.includes("视频确认"), "review summary starts the closed loop with video confirmation");
 assert.ok(appHtml.includes("文案审核"), "review summary includes copy review in the closed loop");
 assert.ok(appHtml.includes("发布确认"), "review summary ends the closed loop with publish confirmation");
+assert.ok(appHtml.includes("AI 审查结果"), "review page renders video quality review panel");
+assert.ok(appHtml.includes('data-action="review-video-quality"'), "review page exposes video quality review action");
 assert.ok(appHtml.includes("生成提示词"), "review storyboard exposes model prompts for review");
 assert.ok(!appHtml.includes('<button class="button" data-view="publish">查看文案</button>'), "review storyboard panel does not show a copy shortcut before copy review");
+
+vm.runInContext(`
+  (() => {
+    const reviewedTask = state.tasks.find((item) => item.id === ${JSON.stringify(task.id)});
+    reviewedTask.videoQualityReview = {
+      status: "fail",
+      score: 58,
+      issues: ["水箱颜色错误", "手部穿过产品边缘"],
+      suggestion: "保留黑色半透明水箱，手只能接触产品表面。",
+      retryPrompt: "上次水箱颜色错误，本次必须保留黑色半透明水箱。",
+      shouldRetry: true,
+      reviewedAt: "2026-06-17T10:30:00.000Z"
+    };
+    view = "review";
+    renderShell();
+  })()
+`, sandbox);
+assert.ok(appHtml.includes("不通过"), "review page shows failed video quality review status");
+assert.ok(appHtml.includes("58"), "review page shows video quality review score");
+assert.ok(appHtml.includes("水箱颜色错误"), "review page shows video quality review issue");
+assert.ok(appHtml.includes("保留黑色半透明水箱"), "review page shows video quality review suggestion");
 
 vm.runInContext(`
   (() => {
@@ -921,30 +1039,63 @@ assert.ok(appHtml.includes("<summary>高级字段</summary>"), "storyboard edito
 
 sandbox.location.hash = "#create";
 vm.runInContext("view = initialView(); renderShell();", sandbox);
-assert.ok(appHtml.includes("新建内容规划"), "create page is focused on content planning");
+assert.ok(appHtml.includes("新建分镜脚本"), "create page is focused on direct storyboard generation");
 assert.ok(appHtml.includes('data-field="contentBrief.seed"'), "create page renders the rough idea input");
+assert.ok(appHtml.includes("视频想法"), "create page labels the input as a video idea");
+assert.ok(appHtml.includes("直接生成可编辑分镜脚本"), "create page explains the direct storyboard flow");
+assert.ok(!appHtml.includes("完整视频内容规划"), "create page no longer describes a content-planning output");
 assert.ok(appHtml.includes('data-file="product-image"'), "create page renders product image upload");
 assert.ok(appHtml.includes("产品参考图组"), "create page renders product reference image group");
+assert.ok(appHtml.includes("推荐 5-7 张"), "create page explains the recommended product reference image count");
+["主图", "正面", "侧面", "背面", "45 度", "细节", "场景图"].forEach((role) => {
+  assert.ok(appHtml.includes(role), `create page shows the recommended ${role} product reference role`);
+});
+assert.ok(appHtml.includes("主图锁定整体外观"), "create page explains the primary image purpose");
+assert.ok(appHtml.includes("场景图只参考环境"), "create page explains scene images do not change product identity");
 assert.ok(appHtml.includes('data-file="product-reference-images"'), "create page renders multi-image upload input");
 assert.ok(appHtml.includes("multiple"), "create page allows selecting multiple product reference images");
 assert.ok(appHtml.includes('data-field="product.imageUrl"'), "create page renders product image URL input");
-assert.ok(appHtml.includes('data-action="generate-content-plan"'), "create page exposes the real content plan generation action");
-assert.ok(appHtml.includes("规划结果"), "create page renders content plan result area");
+assert.ok(!appHtml.includes('data-action="generate-content-plan"'), "create page no longer exposes content-plan-only generation as a visible step");
+const ideaInputIndex = appHtml.indexOf("视频想法");
+const productPanelIndex = appHtml.indexOf("<h2>产品图</h2>");
+assert.ok(ideaInputIndex >= 0 && productPanelIndex > ideaInputIndex, "create page keeps product images after the idea input step");
+assert.ok(!appHtml.includes("查看/编辑后台内容规划"), "create page removes the backend content plan review module");
+assert.ok(!appHtml.includes("<h2>规划结果</h2>"), "create page no longer separates the content plan into a standalone result panel");
+assert.ok(appHtml.includes("<h2>分镜脚本</h2>"), "create page renders the storyboard script as the next step after product images");
 assert.ok(appHtml.includes("product-image-simplified"), "create page uses a simplified product image module");
 assert.ok(!appHtml.includes("reference-empty-controls"), "create page does not render disabled placeholder controls in the image group");
 assert.ok(appHtml.includes("create-layout-vertical"), "create page uses a vertical workflow layout");
-assert.ok(appHtml.includes("content-plan-big-editor"), "create page renders one large editable content plan box");
-assert.ok(appHtml.includes("data-content-plan-text"), "create page exposes one editable content plan text field");
+assert.ok(!appHtml.includes("data-content-plan-text"), "create page no longer exposes an editable content plan text field");
 assert.ok(!appHtml.includes("data-content-plan-field"), "create page no longer splits the content plan into many small fields");
-assert.ok(appHtml.includes('data-action="regenerate-content-plan"'), "create page exposes content plan regeneration");
-assert.ok(appHtml.includes('data-action="restore-previous-content-plan"'), "create page exposes previous content plan restore");
-assert.ok(appHtml.includes("content-plan-editor-actions"), "content plan actions are placed inside the content plan editor header");
+assert.ok(!appHtml.includes('data-action="regenerate-content-plan"'), "create page does not expose content-plan regeneration as a separate step");
+assert.ok(!appHtml.includes('data-action="restore-previous-content-plan"'), "create page does not expose previous-plan restore as a separate step");
+assert.ok(!appHtml.includes("content-plan-editor-actions"), "create page removes content-plan-only action buttons from the default flow");
 assert.ok(!appHtml.includes("stream-output"), "create page no longer renders a separate streaming output box");
 assert.ok(!appHtml.includes("AI 生成过程"), "create page does not split generation process from the editable plan");
-assert.ok(appHtml.includes("content-plan-generation-log"), "create page keeps generation status inside the editable plan box");
+assert.ok(!appHtml.includes('data-stream-log="content-plan"'), "create page does not render a separate content plan generation module");
 assert.ok(!appHtml.includes("content-plan-result"), "create page no longer renders a separate content plan summary card");
 assert.ok(!appHtml.includes("<span>产品理解</span>"), "create page does not duplicate product understanding in a summary grid");
 assert.ok(!appHtml.includes("<span>视频节奏</span>"), "create page does not duplicate rhythm in a summary grid");
+  const generateStoryboardScriptSource = vm.runInContext("generateStoryboardScriptWithUi.toString()", sandbox);
+  const generateVideoForTaskSource = vm.runInContext("generateVideoForTask.toString()", sandbox);
+  const ensureProductImagesHostedForVideoSource = vm.runInContext("ensureProductImagesHostedForVideo.toString()", sandbox);
+  const productReferenceUploadSource = vm.runInContext("handleProductReferenceImagesUpload.toString()", sandbox);
+  assert.ok(productReferenceUploadSource.includes("publicUrl"), "product image upload stores hosted public URLs returned by the server");
+  assert.ok(productReferenceUploadSource.includes("modelVisible"), "product image upload preserves model-visible status returned by the server");
+  assert.ok(
+    generateVideoForTaskSource.indexOf("await ensureProductImagesHostedForVideo(product)") >= 0
+      && generateVideoForTaskSource.indexOf("await ensureProductImagesHostedForVideo(product)") < generateVideoForTaskSource.indexOf("Core.simulateVideoGeneration(state, task)"),
+    "video generation hosts stale local product images before building the provider request"
+  );
+  assert.ok(ensureProductImagesHostedForVideoSource.includes("fetch(image.url)"), "stale local product image hosting reloads saved local upload URLs");
+  assert.ok(ensureProductImagesHostedForVideoSource.includes("uploadProductImageBlob"), "stale local product image hosting reuses the server upload endpoint");
+  assert.ok(ensureProductImagesHostedForVideoSource.includes("image.publicUrl = upload.publicUrl"), "stale local product image hosting writes hosted public URLs back to product images");
+  assert.ok(ensureProductImagesHostedForVideoSource.includes("image.modelVisible = true"), "stale local product image hosting marks product images model-visible");
+  assert.ok(generateVideoForTaskSource.includes("isModelVisibleImageError(error)"), "video generation treats missing model-visible product images as a recoverable preflight issue");
+  assert.ok(generateVideoForTaskSource.includes('task.status = "storyboard_ready"'), "missing public product images restore the task to storyboard-ready instead of failed");
+  assert.ok(generateStoryboardScriptSource.includes("generateStoryboardFromIdeaWithUi"), "one-step storyboard action generates directly from the idea");
+assert.ok(!generateStoryboardScriptSource.includes("generateContentPlanWithUi"), "one-step storyboard action does not call content plan generation");
+assert.ok(!generateStoryboardScriptSource.includes("generateStoryboardFromPlanWithUi"), "one-step storyboard action does not generate from hidden contentPlan");
 const streamingRenderCount = vm.runInContext(`
   (() => {
     const originalRenderShell = renderShell;
@@ -966,7 +1117,7 @@ const contentPlanStreamingLogHtml = vm.runInContext(`
   })
 `, sandbox);
 assert.ok(!contentPlanStreamingLogHtml.includes("RAW_PROVIDER_CHUNK_SHOULD_NOT_REACH_DOM"), "content-plan streaming raw chunks stay out of the DOM so storyboard scrolling is not disturbed");
-assert.ok(contentPlanStreamingLogHtml.includes("结果会在完成后写入内容规划框"), "content-plan streaming shows a compact stable status message");
+assert.ok(contentPlanStreamingLogHtml.includes("完成后会继续生成分镜脚本"), "content-plan streaming shows a compact stable status message");
 const offCreateDoneRenderCount = vm.runInContext(`
   (() => {
     const originalRenderShell = renderShell;
@@ -984,10 +1135,10 @@ const offCreateDoneRenderCount = vm.runInContext(`
 `, sandbox);
 assert.strictEqual(offCreateDoneRenderCount, 0, "completed content-plan streams do not redraw other modules while the user is away from create");
 vm.runInContext(
-  `updateContentPlanStream({ status: "done", label: "内容规划已生成", text: "已收到模型返回，内容规划已写入下方编辑框。", rawText: "# 产品理解\\n最终规划全文" }); renderShell();`,
+  `updateContentPlanStream({ status: "done", label: "内容规划已生成", text: "后台内容规划已完成。", rawText: "# 产品理解\\n最终规划全文" }); renderShell();`,
   sandbox
 );
-assert.ok(appHtml.includes("已收到模型返回，内容规划已写入下方编辑框。"), "done stream output shows a short process log");
+assert.ok(!appHtml.includes("后台内容规划已完成。"), "done content-plan stream output stays out of the create page");
 assert.ok(!appHtml.includes("# 产品理解\\n最终规划全文"), "done stream output does not duplicate the final editable content plan");
 assert.ok(!appHtml.includes("<h2>分镜设置</h2>"), "create page no longer renders a standalone storyboard settings panel");
 assert.ok(appHtml.includes("storyboard-inline-settings"), "create page keeps storyboard settings beside the storyboard generation action");
@@ -995,7 +1146,9 @@ assert.ok(appHtml.includes("storyboard-editor-actions"), "storyboard actions are
 assert.ok(appHtml.includes("data-storyboard-preset"), "create page exposes one storyboard preset dropdown");
 assert.ok(!appHtml.includes('data-field="contentBrief.storyboardSceneCount"'), "create page does not expose scene count as a standalone field");
 assert.ok(!appHtml.includes('data-field="contentBrief.storyboardDetailLevel"'), "create page does not expose detail level as a standalone field");
-assert.ok(appHtml.includes('data-action="generate-storyboard-from-plan"'), "create page can generate storyboard from the confirmed content plan");
+assert.ok(appHtml.includes('data-action="generate-storyboard-script"'), "create page exposes one-step storyboard generation");
+assert.ok(appHtml.includes("生成分镜脚本"), "create page labels the one-step storyboard button");
+assert.ok(!appHtml.includes("用当前规划生成分镜"), "create page removes the old manual storyboard-from-plan wording");
 assert.ok(!appHtml.includes("create-storyboard-preview"), "create page does not render the redundant storyboard preview below the editor");
 assert.ok(!appHtml.includes("storyboard-read-head"), "create page does not duplicate generated storyboard rows below the editor");
 assert.ok(!appJs.includes('view = "review";\\n      finishPending(action);'), "storyboard generation keeps the user on the create page");
@@ -1025,8 +1178,8 @@ vm.runInContext(`
   })()
 `, sandbox);
 const staleContentPlanHtml = appHtml;
-assert.ok(!staleContentPlanHtml.includes("[object Object]"), "create page repairs stale saved content plan text before display");
-assert.ok(staleContentPlanHtml.includes("Hands-free"), "create page rebuilds stale content plan text from structured plan data");
+assert.ok(!staleContentPlanHtml.includes("[object Object]"), "create page does not display stale saved content plan text");
+assert.ok(!staleContentPlanHtml.includes("Hands-free"), "create page does not display backend content plan details");
 assert.ok(appHtml.includes("进入审核生成视频"), "create page links generated plans to review");
 assert.ok(appHtml.includes('data-action="enter-review-video"'), "review transition is an explicit user action");
 assert.ok(appHtml.includes("生成数量"), "create page exposes video batch count beside review entry");
