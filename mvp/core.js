@@ -2008,7 +2008,6 @@
         apiKey: integration.apiKey,
         requiresReferenceImage: true,
         referenceImageValidation,
-        expectedDuration: 15,
         duration: {
           requested: Number(task.duration || 15),
           submitted: 15,
@@ -2087,13 +2086,6 @@
       throw new Error("当前任务还没有视频任务 ID");
     }
     const template = integration.statusEndpoint || "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}";
-    const expectedDuration = Number(
-      generationRequest.expectedDuration ||
-      generationRequest.duration && generationRequest.duration.submitted ||
-      generationRequest.body && generationRequest.body.parameters && generationRequest.body.parameters.duration ||
-      generationRequest.body && generationRequest.body.duration ||
-      task && task.duration
-    ) || 0;
     return {
       provider: integration.provider,
       mode: integration.mode,
@@ -2102,108 +2094,6 @@
       endpoint: template.replace("{task_id}", encodeURIComponent(jobId)),
       model: integration.model,
       apiKey: integration.apiKey,
-      expectedDuration: expectedDuration || undefined,
-    };
-  }
-
-  function videoQualityReferenceFrames(product) {
-    return productMaterials(product).map((material, index) => {
-      const imageUrl = materialUrl(material);
-      return {
-        index,
-        label: `产品参考图-${index + 1}`,
-        role: material.role || "产品参考",
-        source: "reference",
-        dataUrl: imageUrl,
-      };
-    }).filter((frame) => frame.dataUrl);
-  }
-
-  function compactFrameMetadata(frames) {
-    return (Array.isArray(frames) ? frames : []).map((frame, index) => {
-      const copy = Object.assign({}, frame || {}, { index });
-      if (copy.dataUrl) {
-        delete copy.dataUrl;
-        copy.inlineImageProvided = true;
-      }
-      return copy;
-    });
-  }
-
-  function buildVideoQualityReviewProviderRequest(state, task, product, options = {}) {
-    const integration = state.integrations.llm;
-    if (!task || !task.video || !String(task.video.url || "").trim()) {
-      throw new Error("视频生成完成后才能执行 AI 审查。");
-    }
-    const referenceFrames = videoQualityReferenceFrames(product);
-    const generatedFrames = (Array.isArray(options.frames) ? options.frames : [])
-      .map((frame, index) => Object.assign({}, frame || {}, {
-        index,
-        source: "generated_video",
-        label: frame && frame.label || `生成视频关键帧-${index + 1}`,
-      }));
-    const schema = {
-      type: "object",
-      additionalProperties: true,
-      required: ["review_status", "score", "issues", "suggestion", "retry_prompt", "should_retry"],
-      properties: {
-        review_status: { type: "string", enum: ["pass", "warning", "fail"] },
-        score: { type: "number" },
-        issues: { type: "array", items: { type: "string" } },
-        suggestion: { type: "string" },
-        retry_prompt: { type: "string" },
-        should_retry: { type: "boolean" },
-      },
-    };
-    const userContent = {
-      task: {
-        id: task.id,
-        title: task.title,
-        productName: task.productName,
-        duration: task.duration,
-        ratio: task.ratio,
-        video: task.video,
-        storyboard: task.storyboard,
-        reviewSummary: task.reviewSummary,
-      },
-      referenceMaterials: productMaterials(product).map((material) => Object.assign({}, material, {
-        dataUrl: material.dataUrl ? "inline image provided" : "",
-      })),
-      generatedFrameCount: generatedFrames.length,
-      frames: referenceFrames.concat(generatedFrames),
-      frameMetadata: {
-        reference: compactFrameMetadata(referenceFrames),
-        generated: compactFrameMetadata(generatedFrames),
-      },
-      reviewChecklist: [
-        "产品主体是否与参考图一致",
-        "颜色、材质、轮廓、比例和关键结构是否跑偏",
-        "Logo、按钮、出水口、水箱、托盘等关键结构是否丢失或变形",
-        "是否出现人物、手部、桌面、背景与产品的严重穿模、融合、断裂或融化",
-        "画面是否适合进入人工视频审核和后续文案生成",
-      ],
-      scoringPolicy: {
-        pass: "80-100：主体一致，没有明显穿模或结构错误。",
-        warning: "60-79：有轻微问题，需要人工确认。",
-        fail: "0-59：产品跑偏、严重穿模、关键结构错误或不适合继续使用。",
-      },
-      outputFields: ["review_status", "score", "issues", "suggestion", "retry_prompt", "should_retry"],
-      outputLanguage: "zh-CN",
-    };
-    return {
-      provider: integration.provider,
-      mode: integration.mode,
-      apiStyle: integration.apiStyle,
-      endpoint: integration.endpoint,
-      model: integration.model,
-      apiKey: integration.apiKey,
-      body: buildLlmBody(
-        integration,
-        "你是电商视频生成质检员。根据产品参考图和生成视频关键帧，判断视频是否与原产品一致。重点检查产品颜色、轮廓、Logo、关键结构、穿模、融合、断裂和明显变形。不要评价营销创意好不好，只判断是否跑偏以及下一次生成该怎么修正。只输出结构化 JSON。",
-        userContent,
-        "video_quality_review",
-        schema
-      ),
     };
   }
 
@@ -3303,39 +3193,6 @@
     return true;
   }
 
-  function normalizeVideoQualityStatus(value, score) {
-    const status = String(value || "").trim().toLowerCase();
-    if (["pass", "passed", "ok", "通过"].includes(status)) return "pass";
-    if (["warning", "warn", "review", "人工确认", "需人工确认"].includes(status)) return "warning";
-    if (["fail", "failed", "reject", "rejected", "不通过"].includes(status)) return "fail";
-    const numericScore = Number(score);
-    if (Number.isFinite(numericScore)) {
-      if (numericScore >= 80) return "pass";
-      if (numericScore >= 60) return "warning";
-      return "fail";
-    }
-    return "warning";
-  }
-
-  function applyVideoQualityReviewProviderResult(task, response) {
-    const result = providerResult(response);
-    if (!result || typeof result !== "object") return false;
-    const score = Math.max(0, Math.min(100, Number(firstValue(result, ["score", "qualityScore", "quality_score"], 0)) || 0));
-    const status = normalizeVideoQualityStatus(firstValue(result, ["review_status", "reviewStatus", "status"], ""), score);
-    const retryPrompt = firstValue(result, ["retry_prompt", "retryPrompt", "nextPrompt"], "");
-    task.videoQualityReview = {
-      status,
-      score,
-      issues: splitList(firstValue(result, ["issues", "problems"], [])),
-      suggestion: firstValue(result, ["suggestion", "advice", "recommendation"], ""),
-      retryPrompt,
-      shouldRetry: Boolean(firstValue(result, ["should_retry", "shouldRetry"], status === "fail")),
-      reviewedAt: new Date().toISOString(),
-    };
-    task.updatedAt = new Date().toISOString();
-    return true;
-  }
-
   function applyCopyProviderResult(task, response) {
     const result = providerResult(response);
     if (!result || !Array.isArray(result.copies)) return false;
@@ -3771,7 +3628,6 @@
     buildContentBriefProviderRequest,
     buildVideoProviderRequest,
     buildVideoStatusProviderRequest,
-    buildVideoQualityReviewProviderRequest,
     buildPublishProviderRequest,
     buildCancelScheduledPostProviderRequest,
     buildRescheduleScheduledPostProviderRequest,
@@ -3785,7 +3641,6 @@
     applyReverseStoryboardProviderResult,
     applyStoryboardProviderResult,
     applyVideoProviderResult,
-    applyVideoQualityReviewProviderResult,
     applyCopyProviderResult,
     applyPublishProviderResult,
     applyScheduledPostProviderResult,

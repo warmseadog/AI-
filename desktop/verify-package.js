@@ -31,12 +31,9 @@ assert.ok(pkg.scripts["build:mac"].includes("--mac"), "Mac build script targets 
 assert.ok(fs.existsSync(mainPath), "desktop/main.js exists");
 assert.ok(fs.existsSync(preloadPath), "desktop/preload.js exists");
 assert.ok(fs.existsSync(path.join(resourcesBinPath, "ffmpeg.exe")), "Windows ffmpeg binary is bundled");
-assert.ok(fs.existsSync(path.join(resourcesBinPath, "ffprobe.exe")), "Windows ffprobe binary is bundled");
-assert.ok(fs.existsSync(path.join(resourcesBinPath, "ffprobe")), "Mac ffprobe binary is bundled");
 assert.ok(fs.existsSync(path.join(resourcesBinPath, "ffmpeg")), "Mac ffmpeg binary is bundled");
 if (process.platform === "darwin") {
   assert.ok(fs.existsSync(path.join(resourcesBinPath, "lib")), "Mac video tool dylibs are bundled");
-  assert.ok(!linkedLibraries(path.join(resourcesBinPath, "ffprobe")).includes("/opt/homebrew"), "bundled ffprobe does not depend on Homebrew paths");
   assert.ok(!linkedLibraries(path.join(resourcesBinPath, "ffmpeg")).includes("/opt/homebrew"), "bundled ffmpeg does not depend on Homebrew paths");
 }
 
@@ -45,13 +42,21 @@ assert.ok(includedFiles.includes("desktop/**/*"), "desktop files are packaged");
 assert.ok(includedFiles.includes("mvp/**/*"), "MVP files are packaged");
 assert.ok(includedFiles.includes("!mvp/local-config.js"), "local secret config is excluded");
 assert.ok(includedFiles.includes("!outputs/**/*"), "generated outputs are excluded");
-assert.deepStrictEqual(pkg.build.extraResources, [
+assert.strictEqual(pkg.build.extraResources, undefined, "bundled binaries are selected per platform instead of copied wholesale");
+assert.deepStrictEqual(pkg.build.win.extraResources, [
   {
     from: "resources/bin",
     to: "bin",
-    filter: ["**/*"],
+    filter: ["ffmpeg.exe"],
   },
-], "optional bundled binaries are copied into the Windows resources directory");
+], "Windows package copies only the Windows ffmpeg binary");
+assert.deepStrictEqual(pkg.build.mac.extraResources, [
+  {
+    from: "resources/bin",
+    to: "bin",
+    filter: ["ffmpeg", "lib/**/*"],
+  },
+], "Mac package copies only the Mac ffmpeg binary and dylibs");
 assert.ok(pkg.build.nsis.artifactName.includes("installer"), "NSIS installer artifact name is explicit");
 assert.ok(pkg.build.portable.artifactName.includes("portable"), "portable artifact name is explicit");
 assert.notStrictEqual(pkg.build.nsis.artifactName, pkg.build.portable.artifactName, "installer and portable artifacts use different names");
@@ -61,7 +66,6 @@ assert.ok(mainSource.includes("startMvpServer"), "Electron main starts the MVP s
 assert.ok(mainSource.includes("BrowserWindow"), "Electron main creates a desktop window");
 assert.ok(mainSource.includes("desktopDataPaths"), "Electron main uses user-data desktop paths");
 assert.ok(mainSource.includes("AI_VIDEO_FFMPEG_PATH"), "Electron main wires bundled ffmpeg path when present");
-assert.ok(mainSource.includes("AI_VIDEO_FFPROBE_PATH"), "Electron main wires bundled ffprobe path when present");
 
 const preloadSource = fs.readFileSync(preloadPath, "utf8");
 assert.ok(preloadSource.includes("aiVideoWorkbench"), "preload exposes a narrow desktop marker");

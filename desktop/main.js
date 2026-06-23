@@ -20,7 +20,6 @@ function configureBundledBinary(envKey, baseName) {
 
 function configureBundledVideoTools() {
   configureBundledBinary("AI_VIDEO_FFMPEG_PATH", "ffmpeg");
-  configureBundledBinary("AI_VIDEO_FFPROBE_PATH", "ffprobe");
 }
 
 function isAppUrl(url) {

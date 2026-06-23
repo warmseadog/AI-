@@ -2564,47 +2564,6 @@ function renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed) {
   `;
 }
 
-function videoQualityReviewStatusLabel(status) {
-  return {
-    pass: ["success", "通过"],
-    warning: ["warning", "需人工确认"],
-    fail: ["danger", "不通过"],
-  }[status] || ["muted", "未审查"];
-}
-
-function renderVideoQualityReviewPanel(task) {
-  const review = task.videoQualityReview || null;
-  const [statusClassName, statusLabel] = videoQualityReviewStatusLabel(review && review.status);
-  const issues = review && Array.isArray(review.issues) ? review.issues : [];
-  const canReview = Boolean(task.video && task.video.url && task.status === "video_review");
-  return `
-    <div class="panel video-quality-review-panel">
-      <div class="panel-head">
-        <div>
-          <h2>AI 审查结果</h2>
-          <p class="muted">GPT-5.5 对比产品图和视频关键帧，给出一致性判断和下次生成建议。</p>
-        </div>
-        <button class="button compact ${review ? "" : "primary"}" data-action="review-video-quality" ${canReview ? "" : "disabled"}>${review ? "重新审查" : "执行 AI 审查"}</button>
-      </div>
-      <div class="panel-body">
-        ${review ? `
-          <div class="review-fact-grid">
-            <div><span>审查状态</span><strong><span class="status ${statusClassName}">${h(statusLabel)}</span></strong></div>
-            <div><span>一致性分数</span><strong>${h(String(review.score ?? "-"))}</strong></div>
-            <div><span>建议重试</span><strong>${review.shouldRetry ? "是" : "否"}</strong></div>
-            <div><span>审查时间</span><strong>${h(formatTaskDate(review.reviewedAt))}</strong></div>
-          </div>
-          ${issues.length ? `<div class="mini-list"><strong>主要问题</strong><ul>${issues.map((issue) => `<li>${h(issue)}</li>`).join("")}</ul></div>` : `<p class="muted">没有记录明显问题。</p>`}
-          ${review.suggestion ? `<p><strong>审查建议：</strong>${h(review.suggestion)}</p>` : ""}
-          ${review.retryPrompt ? `<p><strong>重试提示词：</strong>${h(review.retryPrompt)}</p>` : ""}
-        ` : `
-          <p class="muted">视频生成完成后，可以执行一次轻量 AI 审查；系统会抽取关键帧并把结果写回这里。</p>
-        `}
-      </div>
-    </div>
-  `;
-}
-
 function renderReviewDetail(task) {
   const canApprove = task.video && task.status === "video_review";
   const isGenerating = task.status === "video_generating";
@@ -2678,7 +2637,6 @@ function renderReviewDetail(task) {
               ${renderReviewDecisionPanel(task, canApprove, isGenerating, isFailed)}
             </div>
           </div>
-          ${renderVideoQualityReviewPanel(task)}
         </aside>
       </div>
       ${storyboardEditorOpen ? renderStoryboardEditor(task) : ""}
@@ -4291,33 +4249,6 @@ async function handleAction(dataset) {
     toast(message);
     return;
   }
-  if (action === "review-video-quality") {
-    if (!startPending(action)) return;
-    try {
-      const review = await reviewVideoQualityForTask(task);
-      finishPending(action);
-      saveState();
-      renderShell();
-      toast(`AI 审查完成：${videoQualityReviewStatusLabel(review.status)[1]}，分数 ${review.score}。`);
-    } catch (error) {
-      task.videoQualityReview = Object.assign({}, task.videoQualityReview || {}, {
-        status: "warning",
-        score: 0,
-        issues: [`审查调用失败：${error.message}`],
-        suggestion: "检查 GPT-5.5 是否支持图片输入、API Key 是否可用，并确认视频已下载到本地后重试。",
-        retryPrompt: "",
-        shouldRetry: false,
-        reviewedAt: new Date().toISOString(),
-      });
-      task.providerResponses = task.providerResponses || {};
-      task.providerResponses.videoQualityReview = { ok: false, error: error.message };
-      finishPending(action);
-      saveState();
-      renderShell();
-      toast(`AI 审查失败：${error.message}`);
-    }
-    return;
-  }
   if (action === "refresh-review-status") {
     const before = task.status;
     if (["copy_review", "ready_to_publish", "published"].includes(task.status)) {
@@ -5141,30 +5072,6 @@ async function refreshVideoForTask(task) {
     task.providerResponses.videoStatus = { ok: false, error: error.message };
     return { ok: false, task, error };
   }
-}
-
-async function reviewVideoQualityForTask(task) {
-  if (!task.video || !task.video.url) {
-    throw new Error("视频生成完成后才能执行 AI 审查。");
-  }
-  if (!shouldInlineReverseFrames()) {
-    throw new Error(reverseVisionRequirementMessage());
-  }
-  const product = Core.getById(state.products, task.productId || state.selectedProductId);
-  const extractedFrames = await extractGeneratedVideoFrames(task);
-  const visionFrames = await loadReverseFrameData(extractedFrames);
-  const request = Core.buildVideoQualityReviewProviderRequest(state, task, product, { frames: visionFrames });
-  task.providerRequests = task.providerRequests || {};
-  task.providerResponses = task.providerResponses || {};
-  task.providerRequests.videoQualityReview = Core.buildVideoQualityReviewProviderRequest(state, task, product, { frames: extractedFrames });
-  task.providerResponses.videoQualityReview = await callProvider("video-quality-review", request);
-  const applied = Core.applyVideoQualityReviewProviderResult(task, task.providerResponses.videoQualityReview);
-  if (!applied) {
-    throw new Error("GPT-5.5 没有返回可用的审查 JSON。");
-  }
-  task.videoQualityReview.frames = extractedFrames.map((frame) => Object.assign({}, frame, { dataUrl: undefined }));
-  task.videoQualityReview.frameCount = extractedFrames.length;
-  return task.videoQualityReview;
 }
 
 function exportState() {

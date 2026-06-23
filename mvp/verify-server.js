@@ -63,15 +63,9 @@ async function main() {
   const outputFixtureDir = path.join(__dirname, "..", "outputs");
   const outputFixturePath = path.join(outputFixtureDir, "verify-static-video.mp4");
   const providerEventsPath = path.join(outputFixtureDir, "provider-events.jsonl");
-  const ffprobeFixturePath = path.join(outputFixtureDir, "verify-ffprobe.js");
   fs.mkdirSync(outputFixtureDir, { recursive: true });
   fs.writeFileSync(outputFixturePath, Buffer.from("verify-video"));
-  fs.writeFileSync(ffprobeFixturePath, "#!/usr/bin/env node\nprocess.stdout.write(process.env.VERIFY_FFPROBE_DURATION || '5.061950');\n");
-  fs.chmodSync(ffprobeFixturePath, 0o755);
   fs.rmSync(providerEventsPath, { force: true });
-  const originalFfprobePath = process.env.AI_VIDEO_FFPROBE_PATH;
-  const originalVerifyFfprobeDuration = process.env.VERIFY_FFPROBE_DURATION;
-  process.env.AI_VIDEO_FFPROBE_PATH = ffprobeFixturePath;
   process.env.IMAGE_HOST_PROVIDER = "";
 
   const server = createServer();
@@ -761,11 +755,10 @@ async function main() {
         endpoint: `${upstreamBaseUrl}/video/official-short-status`,
         model: "doubao-seedance-2-0-260128",
         apiKey: "test-key",
-        expectedDuration: 15,
       },
-    }, { expectOk: false });
-    assert.strictEqual(shortOfficialStatus.response.status, 502, "official Jimeng 5 second output is rejected when 15 seconds is expected");
-    assert.match(shortOfficialStatus.data.error, /视频时长不符合要求/, "short official output gives an operator-readable duration failure");
+    });
+    assert.strictEqual(shortOfficialStatus.ok, true, "official Jimeng status output is accepted without local duration validation");
+    assert.strictEqual(shortOfficialStatus.upstream.data.content.video_url, "https://example.test/short-five-second.mp4", "official Jimeng status preserves upstream video URL");
 
     const downloaded = await request(baseUrl, "/api/video/download", {
       taskId: "task-download-verify",
@@ -919,17 +912,6 @@ async function main() {
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => upstream.close(resolve));
     fs.rmSync(outputFixturePath, { force: true });
-    fs.rmSync(ffprobeFixturePath, { force: true });
-    if (originalFfprobePath === undefined) {
-      delete process.env.AI_VIDEO_FFPROBE_PATH;
-    } else {
-      process.env.AI_VIDEO_FFPROBE_PATH = originalFfprobePath;
-    }
-    if (originalVerifyFfprobeDuration === undefined) {
-      delete process.env.VERIFY_FFPROBE_DURATION;
-    } else {
-      process.env.VERIFY_FFPROBE_DURATION = originalVerifyFfprobeDuration;
-    }
   }
 }
 

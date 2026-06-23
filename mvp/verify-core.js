@@ -546,7 +546,7 @@ const officialStatusRequest = Core.buildVideoStatusProviderRequest(officialState
 assert.strictEqual(officialStatusRequest.apiStyle, "jimeng-seedance-official", "video status query keeps the generation provider API style");
 assert.ok(officialStatusRequest.endpoint.includes("ark.cn-beijing.volces.com"), "video status query uses the generation provider status endpoint");
 assert.ok(!officialStatusRequest.endpoint.includes("toapis.com"), "video status query does not use a later global provider switch");
-assert.strictEqual(officialStatusRequest.expectedDuration, 15, "official Jimeng status query carries the submitted 15 second duration");
+assert.ok(!Object.prototype.hasOwnProperty.call(officialStatusRequest, "expectedDuration"), "video status query no longer carries local duration validation metadata");
 
 function buildVideoResolutionRequest(apiStyle, resolution) {
   const resolutionState = Core.createInitialState();
@@ -1416,40 +1416,6 @@ assert.strictEqual(
   "storyboard_ready",
   "saved local-only image failures are restored to storyboard-ready because the storyboard is still reusable"
 );
-
-const videoQualityReviewRequest = Core.buildVideoQualityReviewProviderRequest(state, created, state.products[0]);
-assert.strictEqual(videoQualityReviewRequest.provider, state.integrations.llm.provider, "video quality review uses configured LLM provider");
-assert.strictEqual(videoQualityReviewRequest.body.model, state.integrations.llm.model, "video quality review uses configured GPT model");
-const videoQualityPayload = userMessagePayload(videoQualityReviewRequest);
-assert.strictEqual(videoQualityPayload.task.video.url, "https://example.test/generated.mp4", "video quality review includes generated video URL");
-assert.strictEqual(videoQualityPayload.referenceMaterials.length, 1, "video quality review includes product reference materials");
-assert.ok(JSON.stringify(videoQualityReviewRequest.body).includes("穿模"), "video quality review checks severe penetration artifacts");
-assert.ok(JSON.stringify(videoQualityReviewRequest.body).includes("retry_prompt"), "video quality review asks for retry prompt advice");
-
-const appliedQualityReview = Core.applyVideoQualityReviewProviderResult(created, {
-  upstream: {
-    data: {
-      choices: [{
-        message: {
-          content: JSON.stringify({
-            review_status: "fail",
-            score: 58,
-            issues: ["水箱颜色错误", "手部穿过产品边缘"],
-            suggestion: "保留黑色半透明水箱，手只能接触产品表面。",
-            retry_prompt: "上次水箱颜色错误，本次必须保留黑色半透明水箱。",
-            should_retry: true,
-          }),
-        },
-      }],
-    },
-  },
-});
-assert.strictEqual(appliedQualityReview, true, "video quality review response is applied");
-assert.strictEqual(created.videoQualityReview.status, "fail", "video quality review stores normalized fail status");
-assert.strictEqual(created.videoQualityReview.score, 58, "video quality review stores normalized score");
-assert.deepStrictEqual(created.videoQualityReview.issues, ["水箱颜色错误", "手部穿过产品边缘"], "video quality review stores issues");
-assert.strictEqual(created.videoQualityReview.shouldRetry, true, "video quality review stores retry decision");
-assert.ok(created.videoQualityReview.retryPrompt.includes("黑色半透明水箱"), "video quality review stores retry prompt");
 
 Core.applyVideoProviderResult(created, {
   upstream: {

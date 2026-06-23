@@ -957,10 +957,6 @@ function ffmpegCommand() {
   return process.env.AI_VIDEO_FFMPEG_PATH || "ffmpeg";
 }
 
-function ffprobeCommand() {
-  return process.env.AI_VIDEO_FFPROBE_PATH || "ffprobe";
-}
-
 function ffmpegAvailable() {
   const result = spawnSync(ffmpegCommand(), ["-version"], { encoding: "utf8" });
   return !result.error && result.status === 0;
@@ -1282,73 +1278,6 @@ function providerVideoUrl(data) {
   return "";
 }
 
-function providerStatusSucceeded(data) {
-  const status = String(data && (data.status || data.state || data.task_status || data.providerStatus) || "").toLowerCase();
-  if (!status) return true;
-  return ["succeeded", "success", "completed", "done", "finished"].includes(status);
-}
-
-function expectedVideoDuration(providerRequest) {
-  const duration = Number(
-    providerRequest && (
-      providerRequest.expectedDuration ||
-      providerRequest.duration && providerRequest.duration.submitted ||
-      providerRequest.body && providerRequest.body.parameters && providerRequest.body.parameters.duration ||
-      providerRequest.body && providerRequest.body.duration
-    )
-  );
-  return Number.isFinite(duration) && duration > 0 ? duration : 0;
-}
-
-function shouldValidateProviderVideoDuration(kind, providerRequest, proxied) {
-  const method = String(providerRequest && providerRequest.method || "POST").toUpperCase();
-  if (kind !== "video" || method !== "GET") return false;
-  if (!isOfficialJimengProviderRequest(providerRequest)) return false;
-  if (!proxied || !proxied.ok || !providerStatusSucceeded(proxied.data)) return false;
-  if (!expectedVideoDuration(providerRequest)) return false;
-  return Boolean(providerVideoUrl(proxied.data));
-}
-
-function probeVideoDurationSeconds(url) {
-  const result = spawnSync(ffprobeCommand(), [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
-    url,
-  ], { encoding: "utf8", timeout: 30000 });
-  if (result.error) {
-    throw new Error(`视频时长检测失败：${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    const stderr = String(result.stderr || "").split("\n").slice(-3).join(" ").trim();
-    throw new Error(`视频时长检测失败：${stderr || `ffprobe exit ${result.status}`}`);
-  }
-  const duration = Number(String(result.stdout || "").trim().split(/\s+/)[0]);
-  if (!Number.isFinite(duration) || duration <= 0) {
-    throw new Error("视频时长检测失败：ffprobe 没有返回有效时长。");
-  }
-  return duration;
-}
-
-function validateProviderVideoDuration(kind, providerRequest, proxied) {
-  if (!shouldValidateProviderVideoDuration(kind, providerRequest, proxied)) return proxied;
-  const expected = expectedVideoDuration(providerRequest);
-  const actual = probeVideoDurationSeconds(providerVideoUrl(proxied.data));
-  const tolerance = 0.75;
-  if (actual < expected - tolerance) {
-    const error = new Error(`视频时长不符合要求：期望 ${expected}s，实际 ${actual.toFixed(2)}s。上游没有按 15 秒出片，请重新生成或检查官方即梦模型/账号是否支持 15 秒。`);
-    error.code = "VIDEO_DURATION_MISMATCH";
-    throw error;
-  }
-  proxied.data = Object.assign({}, proxied.data, {
-    durationCheck: {
-      expectedSeconds: expected,
-      actualSeconds: Number(actual.toFixed(3)),
-    },
-  });
-  return proxied;
-}
-
 async function handleProvider(req, res, kind) {
   let providerRequest = null;
   try {
@@ -1386,23 +1315,7 @@ async function handleProvider(req, res, kind) {
           error: retry.error,
         }),
       }) : await proxyHttp(providerRequest);
-      let finalProxied = proxied;
-      try {
-        finalProxied = validateProviderVideoDuration(kind, providerRequest, proxied);
-      } catch (durationError) {
-        finalProxied = {
-          status: proxied.status,
-          ok: false,
-          attempts: proxied.attempts || 1,
-          data: {
-            error: {
-              code: durationError.code || "VIDEO_DURATION_CHECK_FAILED",
-              message: durationError.message,
-            },
-            upstream: proxied.data,
-          },
-        };
-      }
+      const finalProxied = proxied;
       logProviderEvent({
         ...baseEvent,
         phase: "response",
@@ -1591,10 +1504,6 @@ function createServer() {
       handleProvider(req, res, "video");
       return;
     }
-    if (req.method === "POST" && url.pathname === "/api/provider/video-quality-review") {
-      handleProvider(req, res, "video-quality-review");
-      return;
-    }
     if (req.method === "POST" && url.pathname === "/api/provider/copy") {
       handleProvider(req, res, "copy");
       return;
@@ -1617,4 +1526,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, ffmpegCommand, ffprobeCommand };
+module.exports = { createServer, ffmpegCommand };

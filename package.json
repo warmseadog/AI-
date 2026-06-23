@@ -32,16 +32,28 @@
       "!**/*.log",
       "!**/.DS_Store"
     ],
-    "extraResources": [
-      {
-        "from": "resources/bin",
-        "to": "bin",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
+    "mac": {
+      "extraResources": [
+        {
+          "from": "resources/bin",
+          "to": "bin",
+          "filter": [
+            "ffmpeg",
+            "lib/**/*"
+          ]
+        }
+      ]
+    },
     "win": {
+      "extraResources": [
+        {
+          "from": "resources/bin",
+          "to": "bin",
+          "filter": [
+            "ffmpeg.exe"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "nsis",

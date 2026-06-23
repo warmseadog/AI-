@@ -5,7 +5,7 @@ import path from "path";
 const root = path.resolve(import.meta.dirname, "..");
 const binDir = path.join(root, "resources", "bin");
 const libDir = path.join(binDir, "lib");
-const tools = ["ffmpeg", "ffprobe"];
+const tools = ["ffmpeg"];
 const systemPrefixes = ["/System/", "/usr/lib/"];
 
 function execFile(command, args) {

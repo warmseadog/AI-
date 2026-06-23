@@ -430,31 +430,10 @@ assert.ok(!appHtml.includes("打开原始视频"), "review preview does not expo
 assert.ok(appHtml.includes("视频确认"), "review summary starts the closed loop with video confirmation");
 assert.ok(appHtml.includes("文案审核"), "review summary includes copy review in the closed loop");
 assert.ok(appHtml.includes("发布确认"), "review summary ends the closed loop with publish confirmation");
-assert.ok(appHtml.includes("AI 审查结果"), "review page renders video quality review panel");
-assert.ok(appHtml.includes('data-action="review-video-quality"'), "review page exposes video quality review action");
+assert.ok(!appHtml.includes("AI 审查结果"), "review page no longer renders video quality review panel");
+assert.ok(!appHtml.includes('data-action="review-video-quality"'), "review page no longer exposes video quality review action");
 assert.ok(appHtml.includes("生成提示词"), "review storyboard exposes model prompts for review");
 assert.ok(!appHtml.includes('<button class="button" data-view="publish">查看文案</button>'), "review storyboard panel does not show a copy shortcut before copy review");
-
-vm.runInContext(`
-  (() => {
-    const reviewedTask = state.tasks.find((item) => item.id === ${JSON.stringify(task.id)});
-    reviewedTask.videoQualityReview = {
-      status: "fail",
-      score: 58,
-      issues: ["水箱颜色错误", "手部穿过产品边缘"],
-      suggestion: "保留黑色半透明水箱，手只能接触产品表面。",
-      retryPrompt: "上次水箱颜色错误，本次必须保留黑色半透明水箱。",
-      shouldRetry: true,
-      reviewedAt: "2026-06-17T10:30:00.000Z"
-    };
-    view = "review";
-    renderShell();
-  })()
-`, sandbox);
-assert.ok(appHtml.includes("不通过"), "review page shows failed video quality review status");
-assert.ok(appHtml.includes("58"), "review page shows video quality review score");
-assert.ok(appHtml.includes("水箱颜色错误"), "review page shows video quality review issue");
-assert.ok(appHtml.includes("保留黑色半透明水箱"), "review page shows video quality review suggestion");
 
 vm.runInContext(`
   (() => {
